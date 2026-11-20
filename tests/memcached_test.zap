@@ -1057,3 +1057,175 @@ def _live_cas():
     finally:
         other.disconnect()
         client.disconnect()
+
+def _admin_peer(bytes listener):
+    auto socket = net.accept(listener)
+    try:
+        net.set_deadline_ns(socket, _deadline_after(3.0))
+        auto reader = _Reader(socket, b"")
+        assert reader._read_line() == b"stats"
+        net.send(socket, b"STAT count 7\r\nSTAT words more than one ")
+        net.send(
+            socket,
+            b"word\r\nSTAT empty\r\nSTAT count 8\r\nSTAT blank \r\nEND\r\n",
+        )
+        assert reader._read_line() == b"stats settings"
+        net.send(socket, b"END\r\n")
+        assert reader._read_line() == b"stats slabs extra"
+        net.send(socket, b"STAT slab:1 " + bytes([255, 0]) + b"\r\nEND\r\n")
+        assert reader._read_line() == b"flush_all 0"
+        net.send(socket, b"OK\r\n")
+        assert reader._read_line() == b"flush_all 30 noreply"
+        assert reader._read_line() == b"version"
+        net.send(socket, b"VERSION 1.6-test\r\n")
+        assert reader._read_line() == b"quit"
+        # Neither side should wait for a reply to quit.
+        assert net.recv(socket, 1) == ""
+    finally:
+        net.close_conn(socket)
+    auto next_socket = net.accept(listener)
+    try:
+        net.set_deadline_ns(next_socket, _deadline_after(3.0))
+        auto reader = _Reader(next_socket, b"")
+        assert reader._read_line() == b"version"
+        net.send(next_socket, b"VERSION 1.6-reconnected\r\n")
+        assert net.recv(next_socket, 1) == ""
+    finally:
+        net.close_conn(next_socket)
+
+@test
+def _admin_exchange():
+    auto listener = net.listen("127.0.0.1", 0)
+    try:
+        scope(timeout=5000):
+            spawn _admin_peer(listener)
+            auto client = Client(host="localhost", port=net.port(listener), timeout=3.0)
+            try:
+                auto general = client.stats()
+                assert len(general) == 4
+                assert general[b"count"] == b"8"
+                assert general[b"words"] == b"more than one word"
+                assert general[b"empty"] == b""
+                assert general[b"blank"] == b""
+                assert len(client.stats(b"settings")) == 0
+                auto slabs = client.stats(b"slabs", b"extra")
+                assert slabs[b"slab:1"] == bytes([255, 0])
+                assert client.flush_all()
+                assert client.flush_all(delay=30, noreply=True)
+                assert client.version() == b"1.6-test"
+                client.quit()
+                assert client._reader == None
+                assert client.version() == b"1.6-reconnected"
+            finally:
+                client.disconnect()
+    finally:
+        net.close_listener(listener)
+
+def _admin_bad_peer(bytes listener, list[bytes] commands, list[bytes] replies):
+    for index in range(len(commands)):
+        auto socket = net.accept(listener)
+        try:
+            net.set_deadline_ns(socket, _deadline_after(3.0))
+            auto reader = _Reader(socket, b"")
+            assert reader._read_line() == commands[index]
+            net.send(socket, replies[index])
+            assert net.recv(socket, 1) == ""
+        finally:
+            net.close_conn(socket)
+
+@test
+def _admin_rejects_malformed_replies():
+    auto listener = net.listen("127.0.0.1", 0)
+    list[bytes] commands = [
+        b"stats",
+        b"stats",
+        b"stats",
+        b"version",
+        b"version",
+        b"version",
+        b"flush_all 0",
+    ]
+    list[bytes] replies = [
+        b"ITEM key 7\r\n",
+        b"STAT  value\r\n",
+        b"STAT bad\tname x\r\n",
+        b"VERSION \r\n",
+        b"VERSION bad token\r\n",
+        b"INVALID 1.6\r\n",
+        b"NOT_FOUND\r\n",
+    ]
+    try:
+        scope(timeout=5000):
+            spawn _admin_bad_peer(listener, commands, replies)
+            auto client = Client(host="localhost", port=net.port(listener), timeout=3.0)
+            try:
+                for command in commands:
+                    auto rejected = False
+                    try:
+                        if command == b"stats":
+                            client.stats()
+                        elif command == b"version":
+                            client.version()
+                        else:
+                            client.flush_all()
+                    except MemcacheUnknownError:
+                        rejected = True
+                    assert rejected
+                    assert client._reader == None
+            finally:
+                client.disconnect()
+    finally:
+        net.close_listener(listener)
+
+@test
+def _admin_validates_before_dial():
+    auto client = Client(host="localhost", port=0)
+    for arg in [b"", b"two words", b"bad\r\n", bytes([127])]:
+        auto rejected = False
+        try:
+            client.stats(b"valid", arg)
+        except MemcacheIllegalInputError as message:
+            rejected = message == "A memcached key must use printable ASCII without spaces" or message == "A memcached key must contain 1 to 250 bytes"
+        assert rejected
+    for delay in [-2147483649, 2147483648]:
+        auto out_of_range = False
+        try:
+            client.flush_all(delay=delay, noreply=True)
+        except MemcacheIllegalInputError as message:
+            out_of_range = message == "Expiration must fit in a signed 32-bit integer"
+        assert out_of_range
+    assert client._reader == None
+
+@test
+def _live_admin():
+    auto host = os.getenv("MEMCACHED_TEST_HOST")
+    if host == "":
+        return
+    auto client = Client(host=host, connect_timeout=3.0, timeout=3.0)
+    try:
+        auto server_version = client.version()
+        assert len(server_version) > 0
+        auto general = client.stats()
+        assert general[b"version"] == server_version
+        auto settings = client.stats(b"settings")
+        assert b"maxconns" in settings
+        assert client.set_value(b"admin:stats", b"eligible")
+        assert len(client.stats(b"items")) > 0
+        assert len(client.stats(b"slabs")) > 0
+        assert client.flush_all()
+        assert client.get(b"admin:stats").is_none()
+
+        assert client.set_value(b"admin:delayed", b"eligible")
+        assert client.flush_all(delay=1, noreply=True)
+        auto expired = False
+        for attempt in range(40):
+            if client.get(b"admin:delayed").is_none():
+                expired = True
+                break
+            time.sleep(0.1)
+        assert expired
+        client.quit()
+        assert client._reader == None
+        assert client.version() == server_version
+    finally:
+        client.disconnect()

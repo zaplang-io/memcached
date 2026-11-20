@@ -113,6 +113,20 @@ returns `Some(True)` after sending the request. The token is the decimal
 64-bit integer. Expiration and flags follow the other storage methods.
 [pymemcache CAS](https://pymemcache.readthedocs.io/en/latest/apidoc/pymemcache.client.base.html) · [Text protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt)
 
+## Administrative commands (issue #7)
+
+- `stats(bytes... args)` accepts separate byte tokens, such as
+  `stats(b"settings")`. It returns raw `dict[bytes, bytes]` for the
+  `STAT`/ `END` reply format. It preserves spaces inside values and uses
+  empty bytes for a stat without a value. Callers can interpret numeric
+  values according to their needs.
+  [pymemcache stats](https://pymemcache.readthedocs.io/en/latest/apidoc/pymemcache.client.base.html)
+- `flush_all(delay=0, noreply=False)` returns `True` on `OK` or after a
+  silent send. The server applies the delay using its expiration rules.
+  `version()` returns the single version token. `quit()` sends the command
+  and closes the socket without reading, so the next operation can reconnect.
+  [Text protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt)
+
 <!--
 Add one section per decision as issues are implemented, e.g.:
 

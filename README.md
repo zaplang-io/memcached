@@ -7,7 +7,7 @@ Memcached client for [Zap](https://github.com/zaplang-io/zap) — an official **
 - Contributor & agent conventions: [AGENTS.md](AGENTS.md)
 - Design decisions: [DECISIONS.md](DECISIONS.md)
 
-> **Status: early.** The single-server client supports connection management, storage, retrieval, deletion, counters, touch, and CAS. The [bootstrap epic](https://github.com/zaplang-io/memcached/issues/1) tracks the remaining client features.
+> **Status: early.** The single-server client supports storage, retrieval, deletion, counters, touch, CAS, and administrative commands. The [bootstrap epic](https://github.com/zaplang-io/memcached/issues/1) tracks the remaining client features.
 
 ## Goals
 
@@ -70,6 +70,17 @@ updated = conn.incr(b"counter", uint64(1))
 conn.touch(b"counter", expire=60)
 conn.delete(b"user:1")
 ```
+
+### Administrative commands
+
+`stats()` returns raw names and values as `dict[bytes, bytes]`.
+Pass byte tokens for subcommands such as `stats(b"settings")`,
+`stats(b"items")`, and `stats(b"slabs")`. `version()` returns the
+server version as bytes.
+
+`flush_all(delay=0, noreply=False)` invalidates all items on the server.
+Use `delay` to schedule the flush. `quit()` sends the quit command and
+closes the connection. The next operation reconnects.
 
 ## Planned APIs
 
