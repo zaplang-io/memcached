@@ -135,6 +135,40 @@ def _storage_header(
         header = header + b" noreply"
     return header + b"\r\n"
 
+struct _RetrievedValue:
+    bytes data
+    int64 flags
+    bytes cas
+
+def _reply_uint(bytes field, uint64 maximum) -> uint64:
+    if len(field) == 0:
+        raise MemcacheUnknownError("Empty number in memcached VALUE header")
+    uint64 result = 0
+    for index in range(len(field)):
+        auto digit = field[index] - 48
+        if digit < 0 or digit > 9:
+            raise MemcacheUnknownError("Invalid number in memcached VALUE header")
+        auto unsigned_digit = uint64(digit)
+        if result > (maximum - unsigned_digit) // uint64(10):
+            raise MemcacheUnknownError("Number out of range in memcached VALUE header")
+        result = result * uint64(10) + unsigned_digit
+    return result
+
+def _value_fields(bytes header, bool with_cas) -> list[bytes]:
+    list[bytes] fields = []
+    auto start = 0
+    for index in range(len(header)):
+        if header[index] == 32:
+            fields.append(header[start:index])
+            start = index + 1
+    fields.append(header[start:len(header)])
+    auto expected = 4
+    if with_cas:
+        expected = 5
+    if len(fields) != expected or fields[0] != b"VALUE":
+        raise MemcacheUnknownError("Unexpected memcached VALUE header")
+    return fields
+
 def _read_chunk(bytes socket, int64 size) -> bytes:
     auto data = b""
     try:
@@ -318,6 +352,87 @@ struct Client:
             auto stored = reader._write_storage(header, value, noreply)
             keep = True
             return stored
+        finally:
+            self._finish(keep)
+
+    def get(self, bytes key, Optional[bytes] default = None) -> Optional[bytes]:
+        "Return the stored bytes, or default when the key is absent."
+        auto hits = self._retrieve([key], False)
+        if key in hits:
+            return Optional.Some(hits[key].data)
+        return default
+
+    def gets(self, bytes key) -> (Optional[bytes], Optional[bytes]):
+        "Return the stored bytes and CAS token, or two None values on a miss."
+        auto hits = self._retrieve([key], True)
+        if key in hits:
+            auto hit = hits[key]
+            return (Optional.Some(hit.data), Optional.Some(hit.cas))
+        return (None, None)
+
+    def get_many(self, list[bytes] keys) -> dict[bytes, bytes]:
+        "Return stored bytes for the requested keys that exist."
+        auto hits = self._retrieve(keys, False)
+        dict[bytes, bytes] values = {}
+        for key in hits:
+            values[key] = hits[key].data
+        return values
+
+    def get_multi(self, list[bytes] keys) -> dict[bytes, bytes]:
+        "Return stored bytes for the requested keys that exist. Alias of get_many."
+        return self.get_many(keys)
+
+    def gets_many(self, list[bytes] keys) -> dict[bytes, (bytes, bytes)]:
+        "Return a value and CAS token for each requested key that exists."
+        auto hits = self._retrieve(keys, True)
+        dict[bytes, (bytes, bytes)] values = {}
+        for key in hits:
+            auto hit = hits[key]
+            values[key] = (hit.data, hit.cas)
+        return values
+
+    def _retrieve(
+        self,
+        list[bytes] keys,
+        bool with_cas,
+    ) -> dict[bytes, _RetrievedValue]:
+        dict[bytes, _RetrievedValue] hits = {}
+        if len(keys) == 0:
+            return hits
+
+        dict[bytes, bool] requested = {}
+        list[bytes] parts = [b"get"]
+        if with_cas:
+            parts[0] = b"gets"
+        for key in keys:
+            _validate_key(key)
+            if not key in requested:
+                requested[key] = True
+                parts.append(b" ")
+                parts.append(key)
+        auto command = _join_fragments(parts, 0, len(parts))
+        auto reader = self._begin()
+        auto keep = False
+        try:
+            _send_line(reader._socket, command)
+            while True:
+                auto header = reader._read_line()
+                if header == b"END":
+                    keep = True
+                    return hits
+                auto fields = _value_fields(header, with_cas)
+                auto key = fields[1]
+                if not key in requested or key in hits:
+                    raise MemcacheUnknownError(
+                        "Unrequested or duplicate key in memcached reply",
+                    )
+                auto flags = int64(_reply_uint(fields[2], uint64(4294967295)))
+                auto size = int64(_reply_uint(fields[3], uint64(2147483645)))
+                auto cas = b""
+                if with_cas:
+                    cas = fields[4]
+                    _reply_uint(cas, uint64(-1))
+                hits[key] = _RetrievedValue(reader._read_block(size), flags, cas)
         finally:
             self._finish(keep)
 
@@ -898,19 +1013,12 @@ def _storage_exchange():
         net.close_listener(listener)
 
 def _expect_live_value(Client client, bytes key, int64 flags, bytes value):
-    auto reader = client._begin()
-    auto keep = False
-    try:
-        _send_line(reader._socket, b"gets " + key)
-        auto header = reader._read_line()
-        auto prefix = b"VALUE " + key + bytes(" " + str(flags) + " " + str(len(value)) + " ")
-        assert len(header) > len(prefix)
-        assert header[0:len(prefix)] == prefix
-        assert reader._read_block(len(value)) == value
-        assert reader._read_line() == b"END"
-        keep = True
-    finally:
-        client._finish(keep)
+    auto hits = client._retrieve([key], True)
+    assert len(hits) == 1
+    auto hit = hits[key]
+    assert hit.flags == flags
+    assert hit.data == value
+    assert len(hit.cas) > 0
 
 @test
 def _live_storage():
@@ -955,5 +1063,169 @@ def _live_storage():
         _expect_live_value(client, b"storage-large", 19, large_value)
         assert client.replace(b"storage-large", binary)
         _expect_live_value(client, b"storage-large", 0, binary)
+    finally:
+        client.disconnect()
+
+def _retrieval_peer(bytes listener, bytes binary):
+    auto socket = net.accept(listener)
+    try:
+        net.set_deadline_ns(socket, _deadline_after(3.0))
+        auto reader = _Reader(socket, b"")
+        assert reader._read_line() == b"get binary"
+        net.send(socket, b"VALUE binary 7 4\r")
+        net.send(socket, b"\n" + binary + b"\r\nEND\r\n")
+        for index in range(2):
+            assert reader._read_line() == b"get missing"
+            net.send(socket, b"END\r\n")
+        assert reader._read_line() == b"gets binary"
+        net.send(
+            socket,
+            b"VALUE binary 7 4 18446744073709551615\r\n" + binary + b"\r\nEND\r\n",
+        )
+        assert reader._read_line() == b"gets missing"
+        net.send(socket, b"END\r\n")
+        assert reader._read_line() == b"get binary missing empty"
+        net.send(
+            socket,
+            b"VALUE empty 0 0\r\n\r\nVALUE binary 7 4\r\n" + binary + b"\r\nEND\r\n",
+        )
+        assert reader._read_line() == b"get missing"
+        net.send(socket, b"END\r\n")
+        assert reader._read_line() == b"gets empty missing binary"
+        net.send(
+            socket,
+            b"VALUE binary 7 4 222\r\n" + binary + b"\r\nVALUE empty 4294967295 0 333\r\n\r\nEND\r\n",
+        )
+        assert reader._read_line() == b"gets empty"
+        net.send(socket, b"VALUE empty 4294967295 0 333\r\n\r\nEND\r\n")
+        assert net.recv(socket, 1) == ""
+    finally:
+        net.close_conn(socket)
+
+@test
+def _retrieval_exchange():
+    auto binary = bytes([0, 13, 10, 255])
+    auto listener = net.listen("127.0.0.1", 0)
+    try:
+        scope(timeout=5000):
+            spawn _retrieval_peer(listener, binary)
+            auto client = Client("localhost", port=net.port(listener), timeout=3.0)
+            try:
+                assert len(client.get_many([])) == 0
+                assert len(client.gets_many([])) == 0
+                assert client._reader == None
+                assert client.get(b"binary").unwrap() == binary
+                assert client.get(b"missing").is_none()
+                assert client.get(b"missing", default=Optional.Some(b"fallback")).unwrap() == b"fallback"
+                auto value, cas = client.gets(b"binary")
+                assert value.unwrap() == binary
+                assert cas.unwrap() == b"18446744073709551615"
+                auto absent, absent_cas = client.gets(b"missing")
+                assert absent.is_none()
+                assert absent_cas.is_none()
+
+                auto hits = client.get_many(
+                    [b"binary", b"missing", b"empty", b"binary"],
+                )
+                assert len(hits) == 2
+                assert hits[b"binary"] == binary
+                assert hits[b"empty"] == b""
+                assert not b"missing" in hits
+                assert len(client.get_multi([b"missing", b"missing"])) == 0
+
+                auto cas_hits = client.gets_many([b"empty", b"missing", b"binary"])
+                assert len(cas_hits) == 2
+                auto got, token = cas_hits[b"binary"]
+                assert got == binary and token == b"222"
+                auto empty, empty_cas = cas_hits[b"empty"]
+                assert empty == b"" and empty_cas == b"333"
+                auto flagged = client._retrieve([b"empty"], True)
+                assert flagged[b"empty"].flags == 4294967295
+            finally:
+                client.disconnect()
+    finally:
+        net.close_listener(listener)
+
+def _retrieval_invalid_peer(bytes listener, list[bytes] replies):
+    for reply in replies:
+        auto socket = net.accept(listener)
+        try:
+            net.set_deadline_ns(socket, _deadline_after(3.0))
+            auto reader = _Reader(socket, b"")
+            assert reader._read_line() == b"gets x"
+            net.send(socket, reply)
+            assert net.recv(socket, 1) == ""
+        finally:
+            net.close_conn(socket)
+
+@test
+def _retrieval_rejects_invalid_replies():
+    auto listener = net.listen("127.0.0.1", 0)
+    list[bytes] replies = [
+        b"NOT_FOUND\r\n",
+        b"VALUE x 0 0\r\n",
+        b"VALUE y 0 0 1\r\n",
+        b"VALUE x -1 0 1\r\n",
+        b"VALUE x 4294967296 0 1\r\n",
+        b"VALUE x 0 2147483646 1\r\n",
+        b"VALUE x 0 0 18446744073709551616\r\n",
+        b"VALUE x 0 0 a\r\n",
+        b"VALUE x 0 0 1\r\nx\n",
+        b"VALUE x 0 0 1\r\n\r\nVALUE x 0 0 1\r\n\r\nEND\r\n",
+    ]
+    try:
+        scope(timeout=5000):
+            spawn _retrieval_invalid_peer(listener, replies)
+            auto client = Client("localhost", port=net.port(listener), timeout=3.0)
+            try:
+                for index in range(len(replies)):
+                    auto invalid = False
+                    try:
+                        client.gets(b"x")
+                    except MemcacheUnknownError:
+                        invalid = True
+                    assert invalid
+                    assert client._reader == None
+            finally:
+                client.disconnect()
+    finally:
+        net.close_listener(listener)
+
+@test
+def _live_retrieval():
+    auto host = os.getenv("MEMCACHED_TEST_HOST")
+    if host == "":
+        return
+    auto client = Client(host=host, connect_timeout=3.0, timeout=3.0)
+    try:
+        auto binary = bytes([0, 13, 10, 255])
+        assert client.set_value(b"retrieval:binary", binary, flags=4294967295)
+        assert client.set_value(b"retrieval:empty", b"")
+        assert client.get(b"retrieval:binary").unwrap() == binary
+        assert client.get(b"retrieval:missing").is_none()
+        assert client.get(b"retrieval:missing", default=Optional.Some(b"fallback")).unwrap() == b"fallback"
+        auto value, token = client.gets(b"retrieval:binary")
+        assert value.unwrap() == binary
+        auto hits = client.get_many(
+            [
+                b"retrieval:empty",
+                b"retrieval:missing",
+                b"retrieval:binary",
+                b"retrieval:empty",
+            ],
+        )
+        assert len(hits) == 2
+        assert hits[b"retrieval:empty"] == b""
+        assert hits[b"retrieval:binary"] == binary
+        auto with_cas = client.gets_many([b"retrieval:missing", b"retrieval:binary"])
+        assert len(with_cas) == 1
+        auto batch_value, batch_token = with_cas[b"retrieval:binary"]
+        assert batch_value == binary
+        assert batch_token == token.unwrap()
+        assert client.set_value(b"retrieval:binary", b"updated", flags=21)
+        auto updated, new_token = client.gets(b"retrieval:binary")
+        assert updated.unwrap() == b"updated"
+        assert new_token.unwrap() != batch_token
+        _expect_live_value(client, b"retrieval:binary", 21, b"updated")
     finally:
         client.disconnect()

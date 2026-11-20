@@ -7,7 +7,7 @@ Memcached client for [Zap](https://github.com/zaplang-io/zap) — an official **
 - Contributor & agent conventions: [AGENTS.md](AGENTS.md)
 - Design decisions: [DECISIONS.md](DECISIONS.md)
 
-> **Status: early.** The single-server client supports connection management and the five text storage commands. Retrieval, counters, and pooling are tracked in the [bootstrap epic](https://github.com/zaplang-io/memcached/issues/1).
+> **Status: early.** The single-server client supports connection management, storage, and retrieval. Counters, CAS writes, and pooling are tracked in the [bootstrap epic](https://github.com/zaplang-io/memcached/issues/1).
 
 ## Goals
 
@@ -35,6 +35,8 @@ conn.add(b"user:2", b"bob")
 conn.replace(b"user:1", b"alice", flags=1)
 conn.append(b"user:1", b" smith")
 conn.prepend(b"user:1", b"dr. ")
+got = conn.get(b"user:1")
+hits = conn.get_many([b"user:1", b"user:2"])
 conn.disconnect()
 ```
 
@@ -42,11 +44,15 @@ Each storage method accepts `key`, `value`, `expire=0`, `flags=0`, and
 `noreply=False`. With replies enabled, the boolean reports whether the server
 stored the value. With `noreply=True`, `True` means the write finished.
 
+The retrieval API provides `get(key, default=None)`, `gets(key)`,
+`get_many(keys)` (also named `get_multi`), and `gets_many(keys)`.
+`get` returns an `Optional[bytes]`. `gets` pairs the optional value with an
+optional CAS token. Batch methods return dictionaries containing only hits.
+CAS tokens are decimal bytes.
+
 ## Planned APIs
 
 ```zap
-got = conn.get(b"user:1")          # bytes | None
-hits = conn.get_many([b"a", b"b"]) # dict[bytes, bytes], present keys only
 conn.incr(b"counter", 1)
 conn.delete(b"user:1")
 conn.disconnect()
@@ -69,7 +75,7 @@ Run `zap test src/memcached.zap` with a native-codegen Zap toolchain that includ
 
 GitHub Actions runs the protocol suite and checks formatting on pull requests and pushes to `main`. It also runs `sh tools/run-package-tests.sh` to validate package installation and imports from a path dependency and a temporary local registry.
 
-The loopback suite covers storage command framing and reply handling, including a `noreply` write followed by an acknowledged write on the same socket. CI also runs the storage tests against memcached 1.6. To run the live checks with a dedicated server on port 11211, set `MEMCACHED_TEST_HOST` when invoking `zap test src/memcached.zap`.
+The loopback suite covers storage and retrieval framing, including a `noreply` write followed by an acknowledged write on the same socket. CI also runs storage and retrieval tests against memcached 1.6. To run the live checks with a dedicated server on port 11211, set `MEMCACHED_TEST_HOST` when invoking `zap test src/memcached.zap`.
 
 ## Development
 
