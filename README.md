@@ -7,7 +7,7 @@ Memcached client for [Zap](https://github.com/zaplang-io/zap) — an official **
 - Contributor & agent conventions: [AGENTS.md](AGENTS.md)
 - Design decisions: [DECISIONS.md](DECISIONS.md)
 
-> **Status: early.** The single-server client supports connection management, storage, and retrieval. Counters, CAS writes, and pooling are tracked in the [bootstrap epic](https://github.com/zaplang-io/memcached/issues/1).
+> **Status: early.** The single-server client supports connection management, storage, retrieval, deletion, counters, and touch. CAS writes and pooling are tracked in the [bootstrap epic](https://github.com/zaplang-io/memcached/issues/1).
 
 ## Goals
 
@@ -50,13 +50,23 @@ The retrieval API provides `get(key, default=None)`, `gets(key)`,
 optional CAS token. Batch methods return dictionaries containing only hits.
 CAS tokens are decimal bytes.
 
-## Planned APIs
+`delete(key)` and `touch(key, expire=0)` return `False` when the key is
+absent. `delete_many(keys)` and its alias `delete_multi(keys)` return
+`True` after the whole batch completes, including absent keys.
+
+`incr(key, value)` and `decr(key, value)` take a `uint64` delta and return
+`Optional[uint64]`. A missing counter returns `None`. Each of these commands
+accepts `noreply=True`, which returns `True` for delete and touch and `None`
+for counters after the write completes.
 
 ```zap
-conn.incr(b"counter", 1)
+conn.set_value(b"counter", b"0")
+updated = conn.incr(b"counter", uint64(1))
+conn.touch(b"counter", expire=60)
 conn.delete(b"user:1")
-conn.disconnect()
 ```
+
+## Planned APIs
 
 Multiple servers and pooling follow pymemcache:
 
@@ -75,7 +85,7 @@ Run `zap test src/memcached.zap` with a native-codegen Zap toolchain that includ
 
 GitHub Actions runs the protocol suite and checks formatting on pull requests and pushes to `main`. It also runs `sh tools/run-package-tests.sh` to validate package installation and imports from a path dependency and a temporary local registry.
 
-The loopback suite covers storage and retrieval framing, including a `noreply` write followed by an acknowledged write on the same socket. CI also runs storage and retrieval tests against memcached 1.6. To run the live checks with a dedicated server on port 11211, set `MEMCACHED_TEST_HOST` when invoking `zap test src/memcached.zap`.
+The loopback suite covers command framing, including a `noreply` write followed by an acknowledged command on the same socket. CI also runs the command tests against memcached 1.6. To run the live checks with a dedicated server on port 11211, set `MEMCACHED_TEST_HOST` when invoking `zap test src/memcached.zap`.
 
 ## Development
 

@@ -70,6 +70,12 @@ def _validate_key(bytes key):
                 "A memcached key must use printable ASCII without spaces",
             )
 
+def _validate_expire(int64 expire):
+    if expire < -2147483648 or expire > 2147483647:
+        raise MemcacheIllegalInputError(
+            "Expiration must fit in a signed 32-bit integer",
+        )
+
 def _error_message(bytes line, int64 start) -> str:
     auto raw = line[start:len(line)]
     try:
@@ -119,10 +125,7 @@ def _storage_header(
     if command != b"set" and command != b"add" and command != b"replace" and command != b"append" and command != b"prepend":
         raise MemcacheIllegalInputError("Invalid memcached storage command")
     _validate_key(key)
-    if expire < -2147483648 or expire > 2147483647:
-        raise MemcacheIllegalInputError(
-            "Expiration must fit in a signed 32-bit integer",
-        )
+    _validate_expire(expire)
     if flags < 0 or flags > 4294967295:
         raise MemcacheIllegalInputError("Flags must fit in an unsigned 32-bit integer")
     # The server counts the two trailing delimiter bytes in its stored length.
@@ -142,15 +145,17 @@ struct _RetrievedValue:
 
 def _reply_uint(bytes field, uint64 maximum) -> uint64:
     if len(field) == 0:
-        raise MemcacheUnknownError("Empty number in memcached VALUE header")
+        raise MemcacheUnknownError("Empty unsigned number in memcached reply")
     uint64 result = 0
     for index in range(len(field)):
         auto digit = field[index] - 48
         if digit < 0 or digit > 9:
-            raise MemcacheUnknownError("Invalid number in memcached VALUE header")
+            raise MemcacheUnknownError("Invalid unsigned number in memcached reply")
         auto unsigned_digit = uint64(digit)
         if result > (maximum - unsigned_digit) // uint64(10):
-            raise MemcacheUnknownError("Number out of range in memcached VALUE header")
+            raise MemcacheUnknownError(
+                "Unsigned number out of range in memcached reply",
+            )
         result = result * uint64(10) + unsigned_digit
     return result
 
@@ -258,6 +263,24 @@ struct _Reader:
             return False
         raise MemcacheUnknownError(
             "Unexpected memcached storage reply: " + _error_message(reply, 0),
+        )
+
+    def _send_command(self, bytes line, bool noreply):
+        if noreply:
+            line = line + b" noreply"
+        _send_line(self._socket, line)
+
+    def _write_status(self, bytes line, bytes success, bool noreply) -> bool:
+        self._send_command(line, noreply)
+        if noreply:
+            return True
+        auto reply = self._read_line()
+        if reply == success:
+            return True
+        if reply == b"NOT_FOUND":
+            return False
+        raise MemcacheUnknownError(
+            "Unexpected memcached status reply: " + _error_message(reply, 0),
         )
 
 struct Client:
@@ -390,6 +413,91 @@ struct Client:
             auto hit = hits[key]
             values[key] = (hit.data, hit.cas)
         return values
+
+    def delete(self, bytes key, bool noreply = False) -> bool:
+        "Delete a key. Return False for a miss when replies are enabled."
+        _validate_key(key)
+        return self._change_status(b"delete " + key, b"DELETED", noreply)
+
+    def delete_many(self, list[bytes] keys, bool noreply = False) -> bool:
+        "Attempt every deletion. Return True after all commands complete."
+        if len(keys) == 0:
+            return True
+        list[bytes] commands = []
+        for key in keys:
+            _validate_key(key)
+            commands.append(b"delete " + key)
+
+        auto reader = self._begin()
+        auto keep = False
+        try:
+            for command in commands:
+                reader._write_status(command, b"DELETED", noreply)
+            keep = True
+            return True
+        finally:
+            self._finish(keep)
+
+    def delete_multi(self, list[bytes] keys, bool noreply = False) -> bool:
+        "Alias for delete_many."
+        return self.delete_many(keys, noreply)
+
+    def incr(self, bytes key, uint64 value, bool noreply = False) -> Optional[uint64]:
+        "Increment a counter. Return its new value, or None on a miss or silent write."
+        return self._change_counter(b"incr", key, value, noreply)
+
+    def decr(self, bytes key, uint64 value, bool noreply = False) -> Optional[uint64]:
+        "Decrement a counter with a floor of zero. Return None on a miss or silent write."
+        return self._change_counter(b"decr", key, value, noreply)
+
+    def _change_counter(
+        self,
+        bytes command,
+        bytes key,
+        uint64 value,
+        bool noreply,
+    ) -> Optional[uint64]:
+        _validate_key(key)
+        auto line = command + b" " + key + bytes(" " + str(value))
+        auto reader = self._begin()
+        auto keep = False
+        try:
+            reader._send_command(line, noreply)
+            if noreply:
+                keep = True
+                return None
+            auto reply = reader._read_line()
+            if reply == b"NOT_FOUND":
+                keep = True
+                return None
+            auto end = len(reply)
+            while end > 0 and reply[end - 1] == 32:
+                end = end - 1
+            auto count = _reply_uint(reply[0:end], uint64(-1))
+            keep = True
+            return Optional.Some(count)
+        finally:
+            self._finish(keep)
+
+    def touch(self, bytes key, int64 expire = 0, bool noreply = False) -> bool:
+        "Update a key's expiration. Zero clears expiration."
+        _validate_key(key)
+        _validate_expire(expire)
+        return self._change_status(
+            b"touch " + key + bytes(" " + str(expire)),
+            b"TOUCHED",
+            noreply,
+        )
+
+    def _change_status(self, bytes line, bytes success, bool noreply) -> bool:
+        auto reader = self._begin()
+        auto keep = False
+        try:
+            auto changed = reader._write_status(line, success, noreply)
+            keep = True
+            return changed
+        finally:
+            self._finish(keep)
 
     def _retrieve(
         self,
@@ -1227,5 +1335,213 @@ def _live_retrieval():
         assert updated.unwrap() == b"updated"
         assert new_token.unwrap() != batch_token
         _expect_live_value(client, b"retrieval:binary", 21, b"updated")
+    finally:
+        client.disconnect()
+
+def _delete_touch_peer(bytes listener):
+    auto socket = net.accept(listener)
+    try:
+        net.set_deadline_ns(socket, _deadline_after(3.0))
+        auto reader = _Reader(socket, b"")
+        assert reader._read_line() == b"delete hit"
+        net.send(socket, b"DELETED\r\n")
+        assert reader._read_line() == b"delete miss"
+        net.send(socket, b"NOT_FOUND\r\n")
+        assert reader._read_line() == b"delete first"
+        net.send(socket, b"DELETED\r\n")
+        assert reader._read_line() == b"delete first"
+        net.send(socket, b"NOT_FOUND\r\n")
+        assert reader._read_line() == b"delete second"
+        net.send(socket, b"DELETED\r\n")
+
+        assert reader._read_line() == b"delete quiet noreply"
+        assert reader._read_line() == b"delete a noreply"
+        assert reader._read_line() == b"delete b noreply"
+        assert reader._read_line() == b"touch quiet 2592001 noreply"
+        assert reader._read_line() == b"touch hit 0"
+        net.send(socket, b"TOUCHED\r\n")
+        assert reader._read_line() == b"touch miss -2147483648"
+        net.send(socket, b"NOT_FOUND\r\n")
+        assert reader._read_line() == b"touch malformed 2147483647"
+        net.send(socket, b"DELETED\r\n")
+        assert net.recv(socket, 1) == ""
+    finally:
+        net.close_conn(socket)
+
+@test
+def _delete_touch_exchange():
+    auto listener = net.listen("127.0.0.1", 0)
+    try:
+        scope(timeout=5000):
+            spawn _delete_touch_peer(listener)
+            auto client = Client(host="localhost", port=net.port(listener), timeout=3.0)
+            try:
+                assert client.delete_many([])
+                assert client.delete_multi([], noreply=True)
+                assert client._reader == None
+                assert client.delete(b"hit")
+                assert not client.delete(b"miss")
+                assert client.delete_many([b"first", b"first", b"second"])
+                assert client.delete(b"quiet", noreply=True)
+                assert client.delete_multi([b"a", b"b"], noreply=True)
+                assert client.touch(b"quiet", expire=2592001, noreply=True)
+                assert client.touch(b"hit")
+                assert not client.touch(b"miss", expire=-2147483648)
+
+                auto malformed = False
+                try:
+                    client.touch(b"malformed", expire=2147483647)
+                except MemcacheUnknownError:
+                    malformed = True
+                assert malformed
+                assert client._reader == None
+            finally:
+                client.disconnect()
+    finally:
+        net.close_listener(listener)
+
+@test
+def _delete_touch_validates_before_dial():
+    auto client = Client(host="localhost", port=0)
+    auto invalid_batch = False
+    try:
+        client.delete_many([b"valid", b"bad key"], noreply=True)
+    except MemcacheIllegalInputError as message:
+        invalid_batch = message == "A memcached key must use printable ASCII without spaces"
+    assert invalid_batch
+    for expire in [-2147483649, 2147483648]:
+        auto invalid_expire = False
+        try:
+            client.touch(b"key", expire=expire, noreply=True)
+        except MemcacheIllegalInputError as message:
+            invalid_expire = message == "Expiration must fit in a signed 32-bit integer"
+        assert invalid_expire
+    assert client._reader == None
+
+@test
+def _live_delete_touch():
+    auto host = os.getenv("MEMCACHED_TEST_HOST")
+    if host == "":
+        return
+    auto client = Client(host=host, connect_timeout=3.0, timeout=3.0)
+    try:
+        assert client.set_value(b"delete:one", b"data")
+        assert client.delete(b"delete:one")
+        assert not client.delete(b"delete:one")
+        assert client.delete(b"delete:one", noreply=True)
+        assert client.set_value(b"delete:first", b"data")
+        assert client.set_value(b"delete:second", b"data")
+        assert client.delete_many([b"delete:first", b"delete:absent", b"delete:second"])
+        assert len(client.get_many([b"delete:first", b"delete:second"])) == 0
+        assert client.set_value(b"delete:quiet", b"data")
+        assert client.delete_multi([b"delete:quiet"], noreply=True)
+        assert client.get(b"delete:quiet").is_none()
+
+        assert client.set_value(b"touch:value", b"data", expire=60, flags=19)
+        assert client.touch(b"touch:value", expire=0)
+        _expect_live_value(client, b"touch:value", 19, b"data")
+        auto past = time.time_ns() // 1000000000 - 60
+        assert client.touch(b"touch:value", expire=past, noreply=True)
+        assert client.get(b"touch:value").is_none()
+        assert not client.touch(b"touch:value", expire=60)
+        assert client.touch(b"touch:value", noreply=True)
+        assert client.get(b"touch:value").is_none()
+    finally:
+        client.disconnect()
+
+def _counter_peer(bytes listener):
+    auto socket = net.accept(listener)
+    try:
+        net.set_deadline_ns(socket, _deadline_after(3.0))
+        auto reader = _Reader(socket, b"")
+        assert reader._read_line() == b"incr count 18446744073709551615"
+        net.send(socket, b"18446744073709551615\r\n")
+        assert reader._read_line() == b"decr count 0"
+        net.send(socket, b"9223372036854775808\r\n")
+        assert reader._read_line() == b"incr missing 1"
+        net.send(socket, b"NOT_FOUND\r\n")
+        assert reader._read_line() == b"incr count 1 noreply"
+        assert reader._read_line() == b"decr count 1 noreply"
+        assert reader._read_line() == b"decr count 2"
+        net.send(socket, b"0   \r\n")
+        assert reader._read_line() == b"incr text 1"
+        net.send(socket, b"CLIENT_ERROR cannot increment non-numeric value\r\n")
+        assert net.recv(socket, 1) == ""
+    finally:
+        net.close_conn(socket)
+
+    for reply in [b"18446744073709551616", b"-1", b"1 2", b"   "]:
+        auto next_socket = net.accept(listener)
+        try:
+            net.set_deadline_ns(next_socket, _deadline_after(3.0))
+            auto reader = _Reader(next_socket, b"")
+            assert reader._read_line() == b"decr count 3"
+            net.send(next_socket, reply + b"\r\n")
+            assert net.recv(next_socket, 1) == ""
+        finally:
+            net.close_conn(next_socket)
+
+@test
+def _counter_exchange():
+    auto listener = net.listen("127.0.0.1", 0)
+    try:
+        scope(timeout=5000):
+            spawn _counter_peer(listener)
+            auto client = Client(host="localhost", port=net.port(listener), timeout=3.0)
+            try:
+                assert client.incr(b"count", uint64(-1)).unwrap() == uint64(-1)
+                assert client.decr(b"count", uint64(0)).unwrap() == uint64(9223372036854775807) + uint64(1)
+                assert client.incr(b"missing", uint64(1)).is_none()
+                assert client.incr(b"count", uint64(1), noreply=True).is_none()
+                assert client.decr(b"count", uint64(1), noreply=True).is_none()
+                assert client.decr(b"count", uint64(2)).unwrap() == uint64(0)
+
+                auto nonnumeric = False
+                try:
+                    client.incr(b"text", uint64(1))
+                except MemcacheClientError as message:
+                    nonnumeric = message == "cannot increment non-numeric value"
+                assert nonnumeric
+                assert client._reader == None
+                for index in range(4):
+                    auto malformed = False
+                    try:
+                        client.decr(b"count", uint64(3))
+                    except MemcacheUnknownError:
+                        malformed = True
+                    assert malformed
+                    assert client._reader == None
+            finally:
+                client.disconnect()
+    finally:
+        net.close_listener(listener)
+
+@test
+def _live_counters():
+    auto host = os.getenv("MEMCACHED_TEST_HOST")
+    if host == "":
+        return
+    auto client = Client(host=host, connect_timeout=3.0, timeout=3.0)
+    try:
+        assert client.incr(b"counter:missing", uint64(1)).is_none()
+        assert client.decr(b"counter:missing", uint64(1)).is_none()
+        assert client.set_value(b"counter:num", b"9223372036854775807")
+        assert client.incr(b"counter:num", uint64(1)).unwrap() == uint64(9223372036854775807) + uint64(1)
+        assert client.set_value(b"counter:num", b"18446744073709551615")
+        assert client.incr(b"counter:num", uint64(1)).unwrap() == uint64(0)
+        assert client.decr(b"counter:num", uint64(-1)).unwrap() == uint64(0)
+        assert client.incr(b"counter:num", uint64(-1), noreply=True).is_none()
+        assert client.decr(b"counter:num", uint64(1), noreply=True).is_none()
+        assert client.incr(b"counter:num", uint64(0)).unwrap() == uint64(-1) - uint64(1)
+        assert client.decr(b"counter:num", uint64(-1)).unwrap() == uint64(0)
+
+        assert client.set_value(b"counter:text", b"cat")
+        auto nonnumeric = False
+        try:
+            client.incr(b"counter:text", uint64(1))
+        except MemcacheClientError:
+            nonnumeric = True
+        assert nonnumeric
+        assert client.get(b"counter:text").unwrap() == b"cat"
     finally:
         client.disconnect()
