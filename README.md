@@ -7,7 +7,7 @@ Memcached client for [Zap](https://github.com/zaplang-io/zap) — an official **
 - Contributor & agent conventions: [AGENTS.md](AGENTS.md)
 - Design decisions: [DECISIONS.md](DECISIONS.md)
 
-> **Status: early.** The single-server client supports connection management, storage, retrieval, deletion, counters, and touch. CAS writes and pooling are tracked in the [bootstrap epic](https://github.com/zaplang-io/memcached/issues/1).
+> **Status: early.** The single-server client supports connection management, storage, retrieval, deletion, counters, touch, and CAS. The [bootstrap epic](https://github.com/zaplang-io/memcached/issues/1) tracks the remaining client features.
 
 ## Goals
 
@@ -49,6 +49,11 @@ The retrieval API provides `get(key, default=None)`, `gets(key)`,
 `get` returns an `Optional[bytes]`. `gets` pairs the optional value with an
 optional CAS token. Batch methods return dictionaries containing only hits.
 CAS tokens are decimal bytes.
+
+Pass a token from `gets` or `gets_many` to `cas(key, value, cas)`. It
+returns `Some(True)` when the write succeeds, `Some(False)` when another
+write has changed the token, and `None` when the key is absent. With
+`noreply=True`, `Some(True)` means the request was sent.
 
 `delete(key)` and `touch(key, expire=0)` return `False` when the key is
 absent. `delete_many(keys)` and its alias `delete_multi(keys)` return

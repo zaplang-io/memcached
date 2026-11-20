@@ -103,11 +103,18 @@ is called out in the README usage sketch.
   while the counter methods return `None` without a confirmed value.
   [pymemcache Client](https://pymemcache.readthedocs.io/en/latest/apidoc/pymemcache.client.base.html)
 
+## CAS result modeling (issue #6)
+
+`cas(key, value, cas, expire=0, flags=0, noreply=False)` returns
+`Optional[bool]`. `STORED` returns `Some(True)`, `EXISTS` returns
+`Some(False)`, and `NOT_FOUND` returns `None`. With `noreply=True` it
+returns `Some(True)` after sending the request. The token is the decimal
+`bytes` returned by `gets` or `gets_many` and must fit in an unsigned
+64-bit integer. Expiration and flags follow the other storage methods.
+[pymemcache CAS](https://pymemcache.readthedocs.io/en/latest/apidoc/pymemcache.client.base.html) · [Text protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt)
+
 <!--
 Add one section per decision as issues are implemented, e.g.:
-
-## CAS result modeling (issue #6)
-...STORED / EXISTS / NOT_FOUND vs pymemcache True / False / None...
 
 ## Serde flag map (issue #8)
 ...the exact memcached flag values the typed serde uses...

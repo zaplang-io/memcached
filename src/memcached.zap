@@ -124,6 +124,18 @@ def _storage_header(
 ) -> bytes:
     if command != b"set" and command != b"add" and command != b"replace" and command != b"append" and command != b"prepend":
         raise MemcacheIllegalInputError("Invalid memcached storage command")
+    return _finish_storage_header(
+        _storage_fields(command, key, expire, flags, size),
+        noreply,
+    )
+
+def _storage_fields(
+    bytes command,
+    bytes key,
+    int64 expire,
+    int64 flags,
+    int64 size,
+) -> bytes:
     _validate_key(key)
     _validate_expire(expire)
     if flags < 0 or flags > 4294967295:
@@ -133,7 +145,9 @@ def _storage_header(
         raise MemcacheIllegalInputError(
             "Value length is outside the text protocol range",
         )
-    auto header = command + b" " + key + bytes(" " + str(flags) + " " + str(expire) + " " + str(size))
+    return command + b" " + key + bytes(" " + str(flags) + " " + str(expire) + " " + str(size))
+
+def _finish_storage_header(bytes header, bool noreply) -> bytes:
     if noreply:
         header = header + b" noreply"
     return header + b"\r\n"
@@ -158,6 +172,23 @@ def _reply_uint(bytes field, uint64 maximum) -> uint64:
             )
         result = result * uint64(10) + unsigned_digit
     return result
+
+def _cas_header(
+    bytes key,
+    bytes cas,
+    int64 expire,
+    int64 flags,
+    int64 size,
+    bool noreply,
+) -> bytes:
+    auto fields = _storage_fields(b"cas", key, expire, flags, size)
+    if len(cas) > 20:
+        raise MemcacheIllegalInputError("CAS token must be an unsigned 64-bit decimal")
+    try:
+        _reply_uint(cas, uint64(-1))
+    except MemcacheUnknownError:
+        raise MemcacheIllegalInputError("CAS token must be an unsigned 64-bit decimal")
+    return _finish_storage_header(fields + b" " + cas, noreply)
 
 def _value_fields(bytes header, bool with_cas) -> list[bytes]:
     list[bytes] fields = []
@@ -252,8 +283,11 @@ struct _Reader:
             raise MemcacheUnknownError("Memcached data block must end with CRLF")
         return data
 
-    def _write_storage(self, bytes header, bytes value, bool noreply) -> bool:
+    def _send_storage(self, bytes header, bytes value):
         _send_wire(self._socket, header + value + b"\r\n")
+
+    def _write_storage(self, bytes header, bytes value, bool noreply) -> bool:
+        self._send_storage(header, value)
         if noreply:
             return True
         auto reply = self._read_line()
@@ -358,6 +392,40 @@ struct Client:
     ) -> bool:
         "Add bytes before an existing value while preserving its flags and expiration."
         return self._store(b"prepend", key, value, expire, flags, noreply)
+
+    def cas(
+        self,
+        bytes key,
+        bytes value,
+        bytes cas,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> Optional[bool]:
+        "Store when the token matches. Return False for a stale token and None for a missing key. With noreply, True confirms only the write."
+        auto header = _cas_header(key, cas, expire, flags, len(value), noreply)
+        auto reader = self._begin()
+        auto keep = False
+        try:
+            reader._send_storage(header, value)
+            if noreply:
+                keep = True
+                return Optional.Some(True)
+
+            auto reply = reader._read_line()
+            Optional[bool] stored = None
+            if reply == b"STORED":
+                stored = Optional.Some(True)
+            elif reply == b"EXISTS":
+                stored = Optional.Some(False)
+            elif reply != b"NOT_FOUND":
+                raise MemcacheUnknownError(
+                    "Unexpected memcached CAS reply: " + _error_message(reply, 0),
+                )
+            keep = True
+            return stored
+        finally:
+            self._finish(keep)
 
     def _store(
         self,
@@ -1544,4 +1612,107 @@ def _live_counters():
         assert nonnumeric
         assert client.get(b"counter:text").unwrap() == b"cat"
     finally:
+        client.disconnect()
+
+@test
+def _cas_validates_before_dial():
+    auto client = Client(host="localhost", port=0)
+    for token in [b"", b"-1", b"+1", b" 1", b"1 ", b"1\r\n", b"18446744073709551616", b"000000000000000000000", bytes([255])]:
+        auto invalid = False
+        try:
+            client.cas(b"key", b"value", token, noreply=True)
+        except MemcacheIllegalInputError as message:
+            invalid = message == "CAS token must be an unsigned 64-bit decimal"
+        assert invalid
+    assert client._reader == None
+
+def _cas_peer(bytes listener, bytes binary):
+    auto socket = net.accept(listener)
+    try:
+        net.set_deadline_ns(socket, _deadline_after(3.0))
+        auto reader = _Reader(socket, b"")
+        _expect_storage(reader, b"cas key 4294967295 60 4 18446744073709551615", binary)
+        net.send(socket, b"STORED\r\n")
+        _expect_storage(reader, b"cas key 0 0 0 18446744073709551615", b"")
+        net.send(socket, b"EXISTS\r\n")
+        _expect_storage(reader, b"cas missing 0 0 0 0", b"")
+        net.send(socket, b"NOT_FOUND\r\n")
+        _expect_storage(reader, b"cas key 7 1800000000 4 21 noreply", binary)
+        _expect_storage(reader, b"cas key 0 0 0 21", b"")
+        net.send(socket, b"EXISTS\r\n")
+        _expect_storage(reader, b"cas key 0 0 0 22", b"")
+        net.send(socket, b"NOT_STORED\r\n")
+        assert net.recv(socket, 1) == ""
+    finally:
+        net.close_conn(socket)
+
+@test
+def _cas_exchange():
+    auto binary = bytes([0, 13, 10, 255])
+    auto listener = net.listen("127.0.0.1", 0)
+    try:
+        scope(timeout=5000):
+            spawn _cas_peer(listener, binary)
+            auto client = Client(host="localhost", port=net.port(listener), timeout=3.0)
+            try:
+                assert client.cas(b"key", binary, b"18446744073709551615", expire=60, flags=4294967295).unwrap()
+                assert not client.cas(b"key", b"", b"18446744073709551615").unwrap()
+                assert client.cas(b"missing", b"", b"0").is_none()
+                assert client.cas(b"key", binary, cas=b"21", expire=1800000000, flags=7, noreply=True).unwrap()
+                assert not client.cas(b"key", b"", b"21").unwrap()
+                auto unexpected = False
+                try:
+                    client.cas(b"key", b"", b"22")
+                except MemcacheUnknownError:
+                    unexpected = True
+                assert unexpected
+                assert client._reader == None
+            finally:
+                client.disconnect()
+    finally:
+        net.close_listener(listener)
+
+@test
+def _live_cas():
+    auto host = os.getenv("MEMCACHED_TEST_HOST")
+    if host == "":
+        return
+    auto client = Client(host=host, connect_timeout=3.0, timeout=3.0)
+    auto other = Client(host=host, connect_timeout=3.0, timeout=3.0)
+    try:
+        auto binary = bytes([0, 13, 10, 255])
+        assert client.set_value(b"cas:key", b"original")
+        auto original, token = client.gets(b"cas:key")
+        assert original.unwrap() == b"original"
+        assert client.cas(b"cas:key", binary, cas=token.unwrap(), expire=60, flags=71).unwrap()
+        _expect_live_value(client, b"cas:key", 71, binary)
+        auto updated, new_token = client.gets(b"cas:key")
+        assert updated.unwrap() == binary
+        assert new_token.unwrap() != token.unwrap()
+        assert not client.cas(b"cas:key", b"ignored", token.unwrap()).unwrap()
+
+        assert other.set_value(b"cas:key", b"other writer")
+        assert not client.cas(b"cas:key", b"ignored", new_token.unwrap()).unwrap()
+        assert client.get(b"cas:key").unwrap() == b"other writer"
+        assert other.delete(b"cas:key")
+        assert client.cas(b"cas:key", b"ignored", new_token.unwrap()).is_none()
+
+        assert other.set_value(b"cas:key", b"new")
+        auto batch = client.gets_many([b"cas:key", b"cas:absent"])
+        auto before_quiet, quiet_token = batch[b"cas:key"]
+        assert before_quiet == b"new"
+        assert client.cas(b"cas:key", b"", quiet_token, flags=23, noreply=True).unwrap()
+        _expect_live_value(client, b"cas:key", 23, b"")
+        assert client.cas(b"cas:key", b"ignored", quiet_token, noreply=True).unwrap()
+        assert client.cas(b"cas:absent", b"ignored", quiet_token, noreply=True).unwrap()
+        assert client.get(b"cas:key").unwrap() == b""
+        assert client.get(b"cas:absent").is_none()
+
+        auto final_value, expire_token = client.gets(b"cas:key")
+        assert final_value.unwrap() == b""
+        auto past = time.time_ns() // 1000000000 - 60
+        assert client.cas(b"cas:key", b"expired", expire_token.unwrap(), expire=past).unwrap()
+        assert client.get(b"cas:key").is_none()
+    finally:
+        other.disconnect()
         client.disconnect()
