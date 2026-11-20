@@ -16,9 +16,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Check Zap formatting
-        run: zap fmt --check src
+        run: zap fmt --check src tests
       - name: Execute loopback protocol tests
-        run: timeout -k 5s 60s zap test src/memcached.zap
+        run: timeout -k 5s 60s sh tools/run-tests.sh
   integration:
     name: Live memcached command tests
     runs-on: ubuntu-latest
@@ -39,7 +39,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Execute live command tests
-        run: timeout -k 5s 60s zap test src/memcached.zap
+        run: timeout -k 5s 60s sh tools/run-tests.sh
   package:
     name: Package consumers
     runs-on: ubuntu-latest

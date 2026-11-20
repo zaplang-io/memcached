@@ -86,11 +86,11 @@ memcached speaks a line-oriented **text protocol** and a newer meta/binary proto
 
 ## Build and test
 
-Run `zap test src/memcached.zap` with a native-codegen Zap toolchain that includes [hostname connect deadlines](https://github.com/zaplang-io/zap/issues/1138). The protocol tests use a loopback TCP fake and require no running memcached service.
+Run `sh tools/run-tests.sh` with a native-codegen Zap toolchain that includes [hostname connect deadlines](https://github.com/zaplang-io/zap/issues/1138). The runner stages the library and `tests/memcached_test.zap` together in a temporary module, then runs `zap test` so the suite can exercise private protocol helpers. The loopback tests require no running memcached service.
 
-GitHub Actions runs the protocol suite and checks formatting on pull requests and pushes to `main`. It also runs `sh tools/run-package-tests.sh` to validate package installation and imports from a path dependency and a temporary local registry.
+GitHub Actions runs the protocol suite and checks formatting on pull requests and pushes to `main`. It also runs `sh tools/run-package-tests.sh` to validate installation and imports from a path dependency and a temporary local registry using `tests/package_consumer.zap`.
 
-The loopback suite covers command framing, including a `noreply` write followed by an acknowledged command on the same socket. CI also runs the command tests against memcached 1.6. To run the live checks with a dedicated server on port 11211, set `MEMCACHED_TEST_HOST` when invoking `zap test src/memcached.zap`.
+The loopback suite covers command framing, including a `noreply` write followed by an acknowledged command on the same socket. CI also runs the command tests against memcached 1.6. To run the live checks with a dedicated server on port 11211, set `MEMCACHED_TEST_HOST` when invoking `sh tools/run-tests.sh`.
 
 ## Development
 
