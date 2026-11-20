@@ -213,17 +213,7 @@ struct _Reader:
             raise MemcacheUnknownError("Memcached data block must end with CRLF")
         return data
 
-    # Run a storage command on an already exclusively owned connection.
-    def _store(
-        self,
-        bytes command,
-        bytes key,
-        bytes value,
-        int64 expire = 0,
-        int64 flags = 0,
-        bool noreply = False,
-    ) -> bool:
-        auto header = _storage_header(command, key, expire, flags, len(value), noreply)
+    def _write_storage(self, bytes header, bytes value, bool noreply) -> bool:
         _send_wire(self._socket, header + value + b"\r\n")
         if noreply:
             return True
@@ -256,6 +246,80 @@ struct Client:
         "Close the idle connection. The next command reconnects lazily."
         self._acquire()
         self._finish(False)
+
+    def set_value(
+        self,
+        bytes key,
+        bytes value,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> bool:
+        "Store bytes under a key. With noreply, True confirms only the write."
+        return self._store(b"set", key, value, expire, flags, noreply)
+
+    def add(
+        self,
+        bytes key,
+        bytes value,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> bool:
+        "Store a new key and return False if the key already exists."
+        return self._store(b"add", key, value, expire, flags, noreply)
+
+    def replace(
+        self,
+        bytes key,
+        bytes value,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> bool:
+        "Replace an existing value and return False if the key is absent."
+        return self._store(b"replace", key, value, expire, flags, noreply)
+
+    def append(
+        self,
+        bytes key,
+        bytes value,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> bool:
+        "Add bytes after an existing value while preserving its flags and expiration."
+        return self._store(b"append", key, value, expire, flags, noreply)
+
+    def prepend(
+        self,
+        bytes key,
+        bytes value,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> bool:
+        "Add bytes before an existing value while preserving its flags and expiration."
+        return self._store(b"prepend", key, value, expire, flags, noreply)
+
+    def _store(
+        self,
+        bytes command,
+        bytes key,
+        bytes value,
+        int64 expire,
+        int64 flags,
+        bool noreply,
+    ) -> bool:
+        auto header = _storage_header(command, key, expire, flags, len(value), noreply)
+        auto reader = self._begin()
+        auto keep = False
+        try:
+            auto stored = reader._write_storage(header, value, noreply)
+            keep = True
+            return stored
+        finally:
+            self._finish(keep)
 
     def _acquire(self):
         if not self._busy.compare_and_swap(0, 1):
@@ -740,12 +804,12 @@ def _storage_invalid_inputs():
         assert rejected
 
     auto invalid_key = False
+    auto client = Client(host="localhost", port=0)
     try:
         # An invalid key must raise before any I/O even for noreply.
-        auto reader = _Reader(b"", b"")
-        reader._store(b"set", b"k\r\n", b"", noreply=True)
-    except MemcacheIllegalInputError:
-        invalid_key = True
+        client.set_value(b"k\r\n", b"", noreply=True)
+    except MemcacheIllegalInputError as message:
+        invalid_key = message == "A memcached key must use printable ASCII without spaces"
     assert invalid_key
 
 def _expect_storage(_Reader reader, bytes header, bytes value):
@@ -769,10 +833,18 @@ def _storage_peer(bytes listener, bytes large_value):
         net.send(socket, b"NOT_STORED\r\n")
         _expect_storage(reader, b"set missing 0 0 0", b"")
         net.send(socket, b"CLIENT_ERROR bad value\r\n")
-        _expect_storage(reader, b"set missing 0 0 0", b"")
-        net.send(socket, b"EXISTS\r\n")
+        assert net.recv(socket, 1) == ""
     finally:
         net.close_conn(socket)
+    auto next_socket = net.accept(listener)
+    try:
+        net.set_deadline_ns(next_socket, _deadline_after(3.0))
+        auto reader = _Reader(next_socket, b"")
+        _expect_storage(reader, b"set missing 0 0 0", b"")
+        net.send(next_socket, b"EXISTS\r\n")
+        assert net.recv(next_socket, 1) == ""
+    finally:
+        net.close_conn(next_socket)
 
 @test
 def _storage_exchange():
@@ -783,43 +855,105 @@ def _storage_exchange():
     try:
         scope(timeout=5000):
             spawn _storage_peer(listener, large_value)
-            auto socket = _dial("localhost", net.port(listener), 3.0)
+            auto client = Client(
+                "localhost",
+                port=net.port(listener),
+                connect_timeout=3.0,
+                timeout=3.0,
+            )
             try:
-                net.set_deadline_ns(socket, _deadline_after(3.0))
-                auto reader = _Reader(socket, b"")
-                assert reader._store(
-                    b"set",
+                assert client.set_value(
                     b"cache",
                     large_value,
                     expire=1800000000,
                     flags=51,
                     noreply=True,
                 )
-                assert not reader._store(b"add", b"cache", b"")
-                assert reader._store(
-                    b"replace",
+                assert not client.add(b"cache", b"")
+                assert client.replace(
                     b"cache",
                     bytes([0, 13, 10, 255]),
                     expire=60,
                     flags=9,
                 )
-                assert reader._store(b"append", b"cache", b"a")
-                assert not reader._store(b"prepend", b"missing", b"b")
+                assert client.append(b"cache", b"a")
+                assert not client.prepend(b"missing", b"b")
 
                 auto client_error = False
                 try:
-                    reader._store(b"set", b"missing", b"")
+                    client.set_value(b"missing", b"")
                 except MemcacheClientError as message:
                     client_error = message == "bad value"
                 assert client_error
 
                 auto unknown = False
                 try:
-                    reader._store(b"set", b"missing", b"")
+                    client.set_value(b"missing", b"")
                 except MemcacheUnknownError:
                     unknown = True
                 assert unknown
             finally:
-                net.close_conn(socket)
+                client.disconnect()
     finally:
         net.close_listener(listener)
+
+def _expect_live_value(Client client, bytes key, int64 flags, bytes value):
+    auto reader = client._begin()
+    auto keep = False
+    try:
+        _send_line(reader._socket, b"gets " + key)
+        auto header = reader._read_line()
+        auto prefix = b"VALUE " + key + bytes(" " + str(flags) + " " + str(len(value)) + " ")
+        assert len(header) > len(prefix)
+        assert header[0:len(prefix)] == prefix
+        assert reader._read_block(len(value)) == value
+        assert reader._read_line() == b"END"
+        keep = True
+    finally:
+        client._finish(keep)
+
+@test
+def _live_storage():
+    auto host = os.getenv("MEMCACHED_TEST_HOST")
+    if host == "":
+        return
+    auto client = Client(host=host, connect_timeout=3.0, timeout=3.0)
+    try:
+        auto binary = bytes([0, 13, 10, 255])
+        assert client.set_value(b"storage-binary", binary, expire=60, flags=4294967295)
+        _expect_live_value(client, b"storage-binary", 4294967295, binary)
+        assert not client.add(b"storage-binary", b"ignored")
+        assert client.append(b"storage-binary", b"tail", flags=7)
+        assert client.prepend(b"storage-binary", b"head", expire=-1)
+        _expect_live_value(
+            client,
+            b"storage-binary",
+            4294967295,
+            b"head" + binary + b"tail",
+        )
+
+        assert not client.replace(b"storage-missing", b"miss")
+        assert not client.append(b"storage-missing", b"miss")
+        assert not client.prepend(b"storage-missing", b"miss")
+        assert client.add(b"storage-empty", b"")
+        _expect_live_value(client, b"storage-empty", 0, b"")
+        auto unix_seconds = time.time_ns() // 1000000000
+        assert client.replace(
+            b"storage-empty",
+            b"updated",
+            expire=unix_seconds + 60,
+            flags=11,
+        )
+        _expect_live_value(client, b"storage-empty", 11, b"updated")
+        assert client.set_value(b"storage-expired", b"old", expire=unix_seconds - 60)
+        assert client._request_line(b"get storage-expired") == b"END"
+
+        auto large_value = binary
+        for index in range(15):
+            large_value = large_value + large_value
+        assert client.set_value(b"storage-large", large_value, flags=19, noreply=True)
+        _expect_live_value(client, b"storage-large", 19, large_value)
+        assert client.replace(b"storage-large", binary)
+        _expect_live_value(client, b"storage-large", 0, binary)
+    finally:
+        client.disconnect()
