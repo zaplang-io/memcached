@@ -7,7 +7,7 @@ Memcached client for [Zap](https://github.com/zaplang-io/zap) — an official **
 - Contributor & agent conventions: [AGENTS.md](AGENTS.md)
 - Design decisions: [DECISIONS.md](DECISIONS.md)
 
-> **Status: early / scaffolding.** Text framing, key validation, typed protocol errors, and bounded TCP dialing are in development under [issue #2](https://github.com/zaplang-io/memcached/issues/2). The public client lifecycle depends on [Zap atomic field initialization](https://github.com/zaplang-io/zap/issues/1152). The examples below describe the target API.
+> **Status: early / scaffolding.** [Issue #2](https://github.com/zaplang-io/memcached/issues/2) covers the TCP client lifecycle, text framing, key validation, and typed protocol errors. The command APIs below describe the target surface.
 
 ## Goals
 
@@ -16,6 +16,14 @@ Memcached client for [Zap](https://github.com/zaplang-io/zap) — an official **
 - Values are `bytes` by default, with an optional **serde** layer (serializer/deserializer keyed on memcached flags) for typed values, matching pymemcache's model.
 
 ## Usage (target surface)
+
+Construct a client with `memcached.Client(host="127.0.0.1", port=11211)`.
+Call `connect()` to open the connection immediately or let a command open it
+on demand. Call `disconnect()` to close it. Both methods are idempotent when
+the client is idle. The next command can reconnect after a disconnect or a
+failed exchange. `connect_timeout` and `timeout` are in seconds and default to
+`0.0`, which disables the corresponding deadline. A single client permits
+one operation at a time.
 
 ```zap
 # Sketch — see the epic for what is implemented today.

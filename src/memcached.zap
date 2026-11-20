@@ -30,11 +30,14 @@ struct MemcacheConnectionError:
 struct MemcacheTimeoutError:
     str message
 
-def _deadline_after(f64 seconds) -> int64:
+def _validate_timeout(f64 seconds):
     if not (seconds >= 0.0 and seconds <= 9223372036.0):
         raise MemcacheIllegalInputError(
             "Timeout must be finite and between 0 and 9223372036 seconds",
         )
+
+def _deadline_after(f64 seconds) -> int64:
+    _validate_timeout(seconds)
     if seconds == 0.0:
         return 0
     auto budget = int64(math.ceil(seconds * 1000000000.0))
@@ -232,6 +235,72 @@ struct _Reader:
         raise MemcacheUnknownError(
             "Unexpected memcached storage reply: " + _error_message(reply, 0),
         )
+
+struct Client:
+    str host
+    int64 port = 11211
+    f64 connect_timeout = 0.0
+    f64 timeout = 0.0
+    Atomic[int64] _busy = Atomic(0)
+    _Reader _reader = None
+
+    def connect(self):
+        "Open the configured TCP connection. Reuse it if already open."
+        self._acquire()
+        try:
+            self._open()
+        finally:
+            self._busy.store(0)
+
+    def disconnect(self):
+        "Close the idle connection. The next command reconnects lazily."
+        self._acquire()
+        self._finish(False)
+
+    def _acquire(self):
+        if not self._busy.compare_and_swap(0, 1):
+            raise MemcacheConnectionError("Memcached client is already in use")
+
+    def _open(self):
+        if self._reader == None:
+            _validate_timeout(self.timeout)
+            auto socket = _dial(self.host, self.port, self.connect_timeout)
+            self._reader = _Reader(socket, b"")
+
+    # A successful begin transfers exclusive ownership to the caller until finish.
+    def _begin(self) -> _Reader:
+        self._acquire()
+        auto started = False
+        try:
+            self._open()
+            net.set_deadline_ns(self._reader._socket, _deadline_after(self.timeout))
+            started = True
+            return self._reader
+        finally:
+            if not started:
+                self._finish(False)
+
+    def _finish(self, bool keep):
+        try:
+            if keep:
+                net.set_deadline_ns(self._reader._socket, 0)
+            elif self._reader != None:
+                auto socket = self._reader._socket
+                self._reader = None
+                net.close_conn(socket)
+        finally:
+            self._busy.store(0)
+
+    def _request_line(self, bytes line) -> bytes:
+        auto reader = self._begin()
+        auto keep = False
+        try:
+            _send_line(reader._socket, line)
+            auto reply = reader._read_line()
+            keep = True
+            return reply
+        finally:
+            self._finish(keep)
 
 @test
 def _key_boundaries():
@@ -472,6 +541,163 @@ def _connect_errors():
     except MemcacheConnectionError:
         refused = True
     assert refused
+
+def _lifecycle_peer(bytes listener):
+    for attempt in range(3):
+        auto socket = net.accept(listener)
+        try:
+            net.set_deadline_ns(socket, _deadline_after(3.0))
+            auto reader = _Reader(socket, b"")
+            assert reader._read_line() == b"version"
+            if attempt == 1:
+                net.send(socket, b"SERVER_ERROR test failure\r\n")
+            else:
+                net.send(socket, b"VERSION fake\r\n")
+            assert net.recv(socket, 1) == ""
+        finally:
+            net.close_conn(socket)
+
+@test
+def _client_lifecycle():
+    auto defaults = Client(host="localhost")
+    assert defaults.port == 11211
+    assert defaults.connect_timeout == 0.0
+    assert defaults.timeout == 0.0
+    assert defaults._reader == None
+    defaults.disconnect()
+
+    auto listener = net.listen("127.0.0.1", 0)
+    try:
+        scope(timeout=5000):
+            spawn _lifecycle_peer(listener)
+            auto client = Client(
+                host="localhost",
+                port=net.port(listener),
+                connect_timeout=3.0,
+                timeout=3.0,
+            )
+            try:
+                client.connect()
+                client.connect()
+                assert client._request_line(b"version") == b"VERSION fake"
+                client.disconnect()
+                client.disconnect()
+
+                auto failed = False
+                try:
+                    client._request_line(b"version")
+                except MemcacheServerError as message:
+                    failed = message == "test failure"
+                assert failed
+                assert client._reader == None
+                assert client._request_line(b"version") == b"VERSION fake"
+            finally:
+                client.disconnect()
+    finally:
+        net.close_listener(listener)
+
+def _busy_peer(bytes listener, channel[bool] started, channel[bool] proceed):
+    auto socket = net.accept(listener)
+    try:
+        net.set_deadline_ns(socket, _deadline_after(3.0))
+        auto reader = _Reader(socket, b"")
+        assert reader._read_line() == b"version"
+        started <- True
+        assert <-proceed
+        net.send(socket, b"VERSION fake\r\n")
+    finally:
+        net.close_conn(socket)
+
+def _client_request(Client client):
+    assert client._request_line(b"version") == b"VERSION fake"
+
+@test
+def _client_rejects_concurrent_use():
+    auto listener = net.listen("127.0.0.1", 0)
+    auto client = Client("localhost", port=net.port(listener), timeout=3.0)
+    auto idle = Client("localhost")
+    auto started = channel[bool]()
+    auto proceed = channel[bool]()
+    try:
+        try:
+            scope(timeout=5000):
+                spawn _busy_peer(listener, started, proceed)
+                spawn _client_request(client)
+                assert <-started
+                auto disconnect_rejected = False
+                try:
+                    client.disconnect()
+                except MemcacheConnectionError:
+                    disconnect_rejected = True
+                assert disconnect_rejected
+
+                auto command_rejected = False
+                try:
+                    client._request_line(b"version")
+                except MemcacheConnectionError:
+                    command_rejected = True
+                assert command_rejected
+                idle.disconnect()
+                proceed <- True
+        finally:
+            client.disconnect()
+    finally:
+        net.close_listener(listener)
+
+def _timeout_peer(bytes listener):
+    auto first = net.accept(listener)
+    try:
+        net.set_deadline_ns(first, _deadline_after(3.0))
+        auto reader = _Reader(first, b"")
+        assert reader._read_line() == b"version"
+        net.send(first, b"VERSION partial")
+        assert net.recv(first, 1) == ""
+    finally:
+        net.close_conn(first)
+    auto second = net.accept(listener)
+    try:
+        net.set_deadline_ns(second, _deadline_after(3.0))
+        auto reader = _Reader(second, b"")
+        assert reader._read_line() == b"version"
+        net.send(second, b"VERSION recovered\r\n")
+        assert net.recv(second, 1) == ""
+    finally:
+        net.close_conn(second)
+
+@test
+def _client_timeout_reconnects():
+    auto listener = net.listen("127.0.0.1", 0)
+    try:
+        scope(timeout=5000):
+            spawn _timeout_peer(listener)
+            auto client = Client("localhost", port=net.port(listener), timeout=0.1)
+            try:
+                auto timed_out = False
+                try:
+                    client._request_line(b"version")
+                except MemcacheTimeoutError:
+                    timed_out = True
+                assert timed_out
+                assert client._reader == None
+                client.timeout = 3.0
+                assert client._request_line(b"version") == b"VERSION recovered"
+            finally:
+                client.disconnect()
+    finally:
+        net.close_listener(listener)
+
+@test
+def _client_failed_connect_releases_ownership():
+    auto client = Client("localhost", port=0)
+    for index in range(2):
+        auto rejected = False
+        try:
+            client.connect()
+        except MemcacheIllegalInputError:
+            rejected = True
+        assert rejected
+        assert client._reader == None
+    client.disconnect()
 
 @test
 def _storage_headers():

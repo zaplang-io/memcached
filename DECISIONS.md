@@ -49,9 +49,14 @@ is called out in the README usage sketch.
   Zero disables the timeout. A positive value is rounded up to a nanosecond
   and passed as an absolute monotonic deadline covering DNS and all TCP
   address attempts. [pymemcache Client](https://pymemcache.readthedocs.io/en/latest/apidoc/pymemcache.client.base.html) · [zaplang-io/zap#1138](https://github.com/zaplang-io/zap/issues/1138)
-- The public `Client` constructor and connection lifecycle remain pending
-  per-instance atomic field initialization in
-  [zaplang-io/zap#1152](https://github.com/zaplang-io/zap/issues/1152).
+- `Client(host, port=11211, connect_timeout=0.0, timeout=0.0)` accepts
+  separate TCP host and port arguments as specified in #2. The constructor is
+  lazy, and `connect()` opens explicitly. Zap reserves `close` for channels,
+  so the idle teardown method is named `disconnect()`. `timeout` sets one
+  deadline for an entire command after the dial, covering sends and reads.
+  Each client has a private per-instance atomic guard. A concurrent operation
+  raises `MemcacheConnectionError` so it cannot access the in-flight socket.
+  [pymemcache Client](https://pymemcache.readthedocs.io/en/latest/apidoc/pymemcache.client.base.html) · [Zap atomic field defaults](https://github.com/zaplang-io/zap/issues/1152)
 
 ## Storage wire behavior (issue #3)
 
