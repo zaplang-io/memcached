@@ -27,6 +27,9 @@ MANIFEST
 import memcached
 
 def main():
+    auto client = memcached.Client(host="localhost")
+    assert client.port == 11211
+    client.disconnect()
     try:
         raise memcached.MemcacheServerError("unavailable")
     except memcached.MemcacheServerError as message:
