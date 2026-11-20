@@ -30,6 +30,8 @@ def main():
     auto client = memcached.Client(host="localhost")
     assert client.port == 11211
     client.disconnect()
+    assert len(client.get_many([])) == 0
+    assert len(client.gets_many([])) == 0
     auto invalid_key = False
     try:
         client.set_value(b"", b"value", expire=60, flags=3, noreply=True)

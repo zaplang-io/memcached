@@ -71,6 +71,21 @@ is called out in the README usage sketch.
   flags and expiration when appending or prepending.
   [Text protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt) · [Server parser](https://github.com/memcached/memcached/blob/master/proto_parser.c)
 
+## Retrieval types (issue #4)
+
+- `get(key, default=None)` uses `Optional[bytes]`. `gets(key)` returns
+  `(Optional[bytes], Optional[bytes])` with both elements absent on a miss.
+  Multi-key calls return dictionaries containing only hits. `get_multi`
+  aliases `get_many`. [pymemcache Client](https://pymemcache.readthedocs.io/en/latest/apidoc/pymemcache.client.base.html)
+- CAS tokens are opaque decimal `bytes`, matching pymemcache and preserving
+  the full unsigned 64-bit range for issue #6. The internal results retain
+  flags for the serde layer in issue #8.
+  [Text protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt)
+- Empty batches complete without a connection. A nonempty batch validates
+  every key before dialing and sends each distinct key once. The reader
+  consumes replies through `END` and rejects duplicate or unrequested
+  response keys.
+
 <!--
 Add one section per decision as issues are implemented, e.g.:
 
