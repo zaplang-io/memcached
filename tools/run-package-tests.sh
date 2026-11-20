@@ -38,6 +38,12 @@ def main():
     except memcached.MemcacheIllegalInputError:
         invalid_key = True
     assert invalid_key
+    auto invalid_token = False
+    try:
+        client.cas(b"key", b"value", cas=b"bad", expire=60, flags=3, noreply=True)
+    except memcached.MemcacheIllegalInputError:
+        invalid_token = True
+    assert invalid_token
     try:
         raise memcached.MemcacheServerError("unavailable")
     except memcached.MemcacheServerError as message:
