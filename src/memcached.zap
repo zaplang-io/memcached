@@ -1,0 +1,351 @@
+# The server rejected a command or its arguments.
+struct MemcacheClientError:
+    str message
+
+# The server could not process a command.
+struct MemcacheServerError:
+    str message
+
+# The server did not recognize a command.
+struct MemcacheUnknownCommandError:
+    str message
+
+# The caller supplied an invalid argument.
+struct MemcacheIllegalInputError:
+    str message
+
+# The peer sent a malformed or unexpected protocol response.
+struct MemcacheUnknownError:
+    str message
+
+# The peer closed the connection before a complete reply arrived.
+struct MemcacheUnexpectedCloseError:
+    str message
+
+# The underlying TCP operation failed.
+struct MemcacheConnectionError:
+    str message
+
+# The underlying TCP operation exceeded its deadline.
+struct MemcacheTimeoutError:
+    str message
+
+def _validate_key(bytes key):
+    if len(key) == 0 or len(key) > 250:
+        raise MemcacheIllegalInputError("A memcached key must contain 1 to 250 bytes")
+    for index in range(len(key)):
+        if key[index] < 33 or key[index] > 126:
+            raise MemcacheIllegalInputError(
+                "A memcached key must use printable ASCII without spaces",
+            )
+
+def _error_message(bytes line, int64 start) -> str:
+    auto raw = line[start:len(line)]
+    try:
+        return str(raw)
+    except Exception:
+        return "Non-UTF-8 server error (hex): " + hex.encode(raw)
+
+def _raise_server_error(bytes line):
+    if line == b"ERROR":
+        raise MemcacheUnknownCommandError("The server did not recognize the command")
+    if line == b"CLIENT_ERROR":
+        raise MemcacheClientError("")
+    if len(line) >= 13 and line[0:13] == b"CLIENT_ERROR ":
+        raise MemcacheClientError(_error_message(line, 13))
+    if line == b"SERVER_ERROR":
+        raise MemcacheServerError("")
+    if len(line) >= 13 and line[0:13] == b"SERVER_ERROR ":
+        raise MemcacheServerError(_error_message(line, 13))
+
+def _send_line(bytes socket, bytes line):
+    for index in range(len(line)):
+        if line[index] == 13 or line[index] == 10:
+            raise MemcacheIllegalInputError(
+                "A memcached command line cannot contain CR or LF",
+            )
+    auto wire = line + b"\r\n"
+    auto written = 0
+    try:
+        written = net.send(socket, wire)
+    except TimeoutError as message:
+        raise MemcacheTimeoutError(message)
+    except Exception as message:
+        raise MemcacheConnectionError(message)
+    if written != len(wire):
+        raise MemcacheConnectionError("Incomplete memcached command write")
+
+def _read_chunk(bytes socket, int64 size) -> bytes:
+    auto data = b""
+    try:
+        data = bytes(net.recv(socket, size))
+    except TimeoutError as message:
+        raise MemcacheTimeoutError(message)
+    except Exception as message:
+        raise MemcacheConnectionError(message)
+    if len(data) == 0:
+        raise MemcacheUnexpectedCloseError(
+            "Memcached closed the connection before completing its reply",
+        )
+    return data
+
+def _join_fragments(list[bytes] fragments, int64 start, int64 stop) -> bytes:
+    if start == stop:
+        return b""
+    if stop - start == 1:
+        return fragments[start]
+    auto middle = start + (stop - start) // 2
+    return _join_fragments(fragments, start, middle) + _join_fragments(fragments, middle, stop)
+
+# One reader owns the unread bytes for one socket. The caller supplies the
+# operation deadline and discards the socket and reader after framing failures.
+struct _Reader:
+    bytes _socket
+    bytes _pending
+
+    def _read_line(self) -> bytes:
+        auto scan = 0
+        while True:
+            while scan < len(self._pending):
+                if self._pending[scan] == 10:
+                    raise MemcacheUnknownError("Bare LF in memcached reply")
+                if self._pending[scan] == 13:
+                    if scan + 1 == len(self._pending):
+                        break
+                    if self._pending[scan + 1] != 10:
+                        raise MemcacheUnknownError("CR without LF in memcached reply")
+                    auto line = self._pending[0:scan]
+                    self._pending = self._pending[scan + 2:len(self._pending)]
+                    _raise_server_error(line)
+                    return line
+                if scan == 8192:
+                    raise MemcacheUnknownError(
+                        "Memcached reply line exceeds 8192 bytes",
+                    )
+                scan = scan + 1
+            self._pending = self._pending + _read_chunk(self._socket, 4096)
+
+    # Consume exactly size bytes before reading the mandatory block delimiter.
+    def _take(self, int64 size) -> bytes:
+        if size <= len(self._pending):
+            auto data = self._pending[0:size]
+            self._pending = self._pending[size:len(self._pending)]
+            return data
+        list[bytes] fragments = []
+        if len(self._pending) > 0:
+            fragments.append(self._pending)
+        auto remaining = size - len(self._pending)
+        self._pending = b""
+        while remaining > 0:
+            auto chunk_size = remaining
+            if chunk_size > 65536:
+                chunk_size = 65536
+            auto data = _read_chunk(self._socket, chunk_size)
+            fragments.append(data)
+            remaining = remaining - len(data)
+        return _join_fragments(fragments, 0, len(fragments))
+
+    def _read_block(self, int64 size) -> bytes:
+        if size < 0:
+            raise MemcacheUnknownError("Negative memcached block length")
+        auto data = self._take(size)
+        if self._take(2) != b"\r\n":
+            raise MemcacheUnknownError("Memcached data block must end with CRLF")
+        return data
+
+@test
+def _key_boundaries():
+    _validate_key(b"!")
+    _validate_key(b"with:punctuation~")
+    auto longest = b""
+    for index in range(250):
+        longest = longest + b"k"
+    _validate_key(longest)
+
+    list[bytes] invalid = [
+        b"",
+        longest + b"k",
+        b"space here",
+        b"\n",
+        b"\r",
+        b"\t",
+        bytes([0]),
+        bytes([31]),
+        bytes([127]),
+        bytes([255]),
+        bytes("é"),
+    ]
+    for key in invalid:
+        auto rejected = False
+        try:
+            _validate_key(key)
+        except MemcacheIllegalInputError:
+            rejected = True
+        assert rejected
+
+@test
+def _coalesced_frames():
+    auto reader = _Reader(
+        b"",
+        b"FIRST\r\n\r\nVALUE k 0 4\r\n" + bytes([0, 13, 10, 255]) + b"\r\nEND\r\n",
+    )
+    assert reader._read_line() == b"FIRST"
+    assert reader._read_line() == b""
+    assert reader._read_line() == b"VALUE k 0 4"
+    assert reader._read_block(4) == bytes([0, 13, 10, 255])
+    assert reader._read_line() == b"END"
+
+    auto empty = _Reader(b"", b"\r\nEND\r\n")
+    assert empty._read_block(0) == b""
+    assert empty._read_line() == b"END"
+
+@test
+def _invalid_frames():
+    auto line_limit = b"01234567"
+    for index in range(10):
+        line_limit = line_limit + line_limit
+    auto maximum = _Reader(b"", line_limit + b"\r\n")
+    assert maximum._read_line() == line_limit
+    for wire in [b"bare\n", b"wrong\rX", line_limit + b"X\r\n"]:
+        auto reader = _Reader(b"", wire)
+        auto rejected = False
+        try:
+            reader._read_line()
+        except MemcacheUnknownError:
+            rejected = True
+        assert rejected
+
+    auto block = _Reader(b"", b"x\rX")
+    auto malformed = False
+    try:
+        block._read_block(1)
+    except MemcacheUnknownError:
+        malformed = True
+    assert malformed
+    auto negative = False
+    try:
+        block._read_block(-1)
+    except MemcacheUnknownError:
+        negative = True
+    assert negative
+
+@test
+def _server_errors():
+    auto reader = _Reader(
+        b"",
+        b"ERROR\r\nCLIENT_ERROR invalid argument\r\nSERVER_ERROR \r\nSERVER_ERROR " + bytes([255]) + b"\r\nCLIENT_ERROR\r\nSERVER_ERROR\r\nERROR_LIKE\r\n",
+    )
+    auto command = False
+    try:
+        reader._read_line()
+    except MemcacheUnknownCommandError:
+        command = True
+    assert command
+    auto client = False
+    try:
+        reader._read_line()
+    except MemcacheClientError as message:
+        client = message == "invalid argument"
+    assert client
+    auto empty = False
+    try:
+        reader._read_line()
+    except MemcacheServerError as message:
+        empty = message == ""
+    assert empty
+    auto binary = False
+    try:
+        reader._read_line()
+    except MemcacheServerError as message:
+        binary = message == "Non-UTF-8 server error (hex): ff"
+    assert binary
+    auto empty_client = False
+    try:
+        reader._read_line()
+    except MemcacheClientError as message:
+        empty_client = message == ""
+    assert empty_client
+    auto empty_server = False
+    try:
+        reader._read_line()
+    except MemcacheServerError as message:
+        empty_server = message == ""
+    assert empty_server
+    assert reader._read_line() == b"ERROR_LIKE"
+
+def _fake_server(bytes listener, bytes value):
+    auto socket = net.accept(listener)
+    try:
+        net.set_read_deadline(socket, 3000)
+        auto reader = _Reader(socket, b"")
+        assert reader._read_line() == b"version"
+        net.send(socket, b"VERSION 1.6\r\n" + value + b"\r\nEND\r\n")
+        net.send(socket, b"partial")
+    finally:
+        net.close_conn(socket)
+
+@test
+def _loopback_protocol():
+    auto listener = net.listen("127.0.0.1", 0)
+    auto value = bytes([0, 13, 10, 255])
+    for index in range(15):
+        value = value + value
+    try:
+        scope(timeout=5000):
+            spawn _fake_server(listener, value)
+            auto socket = net.connect("127.0.0.1", net.port(listener))
+            try:
+                net.set_read_deadline(socket, 3000)
+                auto rejected = False
+                try:
+                    _send_line(socket, b"version\r\n")
+                except MemcacheIllegalInputError:
+                    rejected = True
+                assert rejected
+                _send_line(socket, b"version")
+                auto reader = _Reader(socket, b"")
+                # Preload through CR to exercise a split delimiter regardless
+                # of how the OS segments the fake server's response.
+                reader._pending = reader._take(len(b"VERSION 1.6\r"))
+                assert reader._read_line() == b"VERSION 1.6"
+                assert reader._read_block(len(value)) == value
+                assert reader._read_line() == b"END"
+                auto closed = False
+                try:
+                    reader._read_line()
+                except MemcacheUnexpectedCloseError:
+                    closed = True
+                assert closed
+            finally:
+                net.close_conn(socket)
+    finally:
+        net.close_listener(listener)
+
+def _wait_for_close(bytes listener):
+    auto socket = net.accept(listener)
+    try:
+        net.set_read_deadline(socket, 3000)
+        assert net.recv(socket, 1) == ""
+    finally:
+        net.close_conn(socket)
+
+@test
+def _read_timeout():
+    auto listener = net.listen("127.0.0.1", 0)
+    try:
+        scope(timeout=5000):
+            spawn _wait_for_close(listener)
+            auto socket = net.connect("127.0.0.1", net.port(listener))
+            try:
+                net.set_read_deadline(socket, 30)
+                auto reader = _Reader(socket, b"VERSION 1.6\r")
+                auto timed_out = False
+                try:
+                    reader._read_line()
+                except MemcacheTimeoutError:
+                    timed_out = True
+                assert timed_out
+            finally:
+                net.close_conn(socket)
+    finally:
+        net.close_listener(listener)

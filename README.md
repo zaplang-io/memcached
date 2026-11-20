@@ -7,7 +7,7 @@ Memcached client for [Zap](https://github.com/zaplang-io/zap) — an official **
 - Contributor & agent conventions: [AGENTS.md](AGENTS.md)
 - Design decisions: [DECISIONS.md](DECISIONS.md)
 
-> **Status: early / scaffolding.** The protocol framing and command surface are being built out issue-by-issue (see the epic). The APIs sketched below describe the *target* surface and are not all implemented yet.
+> **Status: early / scaffolding.** Text framing, key validation, and typed protocol errors are in development under [issue #2](https://github.com/zaplang-io/memcached/issues/2). The TCP client depends on [Zap hostname connect deadlines](https://github.com/zaplang-io/zap/issues/1138). The examples below describe the target API.
 
 ## Goals
 
@@ -41,11 +41,11 @@ ring = memcached.HashClient([(b"10.0.0.1", 11211), (b"10.0.0.2", 11211)])
 
 ## Protocol
 
-memcached speaks a line-oriented **text protocol** and a newer meta/binary protocol. This client implements the text protocol first; the meta protocol is deferred (DECISIONS.md). Keys are protocol-legal `bytes` (no spaces/control characters, ≤250 bytes); values are `bytes`.
+memcached speaks a line-oriented **text protocol** and a newer meta/binary protocol. This client implements the text protocol first. The meta protocol is deferred (DECISIONS.md). Keys are 1–250 printable ASCII bytes with no spaces. Values are `bytes`.
 
 ## Build and test
 
-Standard Zap package build/test. Prefer a local `memcached` (or an in-process fake) for integration tests; live tests are gated. Details will be documented as the first commands land.
+Run `zap test src/memcached.zap` with a Zap toolchain that has native code generation enabled. The protocol tests use a loopback TCP fake and require no running memcached service.
 
 ## Development
 
