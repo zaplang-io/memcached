@@ -49,6 +49,8 @@ Run `zap test src/memcached.zap` with a native-codegen Zap toolchain that includ
 
 GitHub Actions runs the protocol suite and checks formatting on pull requests and pushes to `main`. It also runs `sh tools/run-package-tests.sh` to validate package installation and imports from a path dependency and a temporary local registry.
 
+The loopback suite covers storage command framing and reply handling for [issue #3](https://github.com/zaplang-io/memcached/issues/3), including a `noreply` write followed by an acknowledged write on the same socket.
+
 ## Development
 
 Read **[AGENTS.md](AGENTS.md)** before contributing — it covers the pymemcache-parity rule, the one-issue-one-PR flow, how design decisions are recorded in **[DECISIONS.md](DECISIONS.md)**, and the rule for reporting core Zap language/stdlib defects upstream in `zaplang-io/zap` (rather than working around them here).
