@@ -53,11 +53,21 @@ is called out in the README usage sketch.
   per-instance atomic field initialization in
   [zaplang-io/zap#1152](https://github.com/zaplang-io/zap/issues/1152).
 
+## Storage wire behavior (issue #3)
+
+- The five storage verbs return `bool` on the wire path. `STORED` maps to
+  `True`, and `NOT_STORED` maps to `False`. `EXISTS` and `NOT_FOUND`
+  belong to CAS in issue #6. With `noreply=True`, the client returns `True`
+  when the write finishes and has no acknowledgement of storage. The
+  default is `noreply=False` as specified in #3. [pymemcache response mapping](https://github.com/pinterest/pymemcache/blob/master/pymemcache/client/base.py)
+- The text header emits flags as an unsigned 32-bit decimal and expiration
+  as a signed 32-bit decimal, matching the default server build. Memcached
+  interprets expiration using its 30-day cutoff and preserves the original
+  flags and expiration when appending or prepending.
+  [Text protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt) · [Server parser](https://github.com/memcached/memcached/blob/master/proto_parser.c)
+
 <!--
 Add one section per decision as issues are implemented, e.g.:
-
-## Storage result modeling (issue #3)
-...which pymemcache bool/None result maps to which declared Zap return type...
 
 ## CAS result modeling (issue #6)
 ...STORED / EXISTS / NOT_FOUND vs pymemcache True / False / None...
