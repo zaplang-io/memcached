@@ -19,6 +19,27 @@ jobs:
         run: zap fmt --check src
       - name: Execute loopback protocol tests
         run: timeout -k 5s 60s zap test src/memcached.zap
+  integration:
+    name: Live memcached storage tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    container: ghcr.io/zaplang-io/zap:latest
+    services:
+      memcached:
+        image: memcached:1.6@sha256:a395a1bcf5e0e2b0fa4a0142e12b4e24a2320ba4b7c6ffa8655a1a86e8f29dee
+        options: >-
+          --health-cmd "bash -c ': </dev/tcp/127.0.0.1/11211'"
+          --health-interval 1s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      MEMCACHED_TEST_HOST: memcached
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Execute live storage tests
+        run: timeout -k 5s 60s zap test src/memcached.zap
   package:
     name: Package consumers
     runs-on: ubuntu-latest

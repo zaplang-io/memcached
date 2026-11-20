@@ -30,6 +30,12 @@ def main():
     auto client = memcached.Client(host="localhost")
     assert client.port == 11211
     client.disconnect()
+    auto invalid_key = False
+    try:
+        client.set_value(b"", b"value", expire=60, flags=3, noreply=True)
+    except memcached.MemcacheIllegalInputError:
+        invalid_key = True
+    assert invalid_key
     try:
         raise memcached.MemcacheServerError("unavailable")
     except memcached.MemcacheServerError as message:

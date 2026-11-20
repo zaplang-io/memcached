@@ -60,7 +60,7 @@ is called out in the README usage sketch.
 
 ## Storage wire behavior (issue #3)
 
-- The five storage verbs return `bool` on the wire path. `STORED` maps to
+- The five storage methods return `bool`. `STORED` maps to
   `True`, and `NOT_STORED` maps to `False`. `EXISTS` and `NOT_FOUND`
   belong to CAS in issue #6. With `noreply=True`, the client returns `True`
   when the write finishes and has no acknowledgement of storage. The
