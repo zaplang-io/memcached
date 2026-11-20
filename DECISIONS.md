@@ -29,6 +29,30 @@ mirroring the precedent set by the redis package. The remaining storage verbs
 keep their pymemcache names. This is the one rename forced by the language; it
 is called out in the README usage sketch.
 
+## Text framing and errors (issue #2)
+
+- The wire reader keeps reply lines and data blocks as `bytes`. It consumes a
+  line through CRLF or a data block through its declared length plus CRLF.
+  Reply lines have an 8 KiB limit so an unterminated reply cannot grow the
+  line buffer indefinitely. The limit applies only to lines. [Text protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt)
+- Keys must contain 1–250 printable ASCII bytes (0x21–0x7e). Callers that need
+  to cache data under another key representation supply an ASCII encoding.
+  [Text protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt)
+- The draft uses named Zap error structs catchable by their type or by
+  `Exception`. The public equivalent of pymemcache's `MemcacheError` base
+  remains a design decision because Zap user-defined types lack custom
+  inheritance (D-0015). Timeout and TCP failure have distinct package types,
+  corresponding to pymemcache's timeout and socket errors. Server messages
+  are decoded as UTF-8, with hex used for invalid UTF-8.
+  [pymemcache Client](https://pymemcache.readthedocs.io/en/latest/apidoc/pymemcache.client.base.html)
+- The TCP dial helper takes a connect timeout in seconds, like pymemcache.
+  Zero disables the timeout. A positive value is rounded up to a nanosecond
+  and passed as an absolute monotonic deadline covering DNS and all TCP
+  address attempts. [pymemcache Client](https://pymemcache.readthedocs.io/en/latest/apidoc/pymemcache.client.base.html) · [zaplang-io/zap#1138](https://github.com/zaplang-io/zap/issues/1138)
+- The public `Client` constructor and connection lifecycle remain pending
+  per-instance atomic field initialization in
+  [zaplang-io/zap#1152](https://github.com/zaplang-io/zap/issues/1152).
+
 <!--
 Add one section per decision as issues are implemented, e.g.:
 
