@@ -30,6 +30,34 @@ struct MemcacheConnectionError:
 struct MemcacheTimeoutError:
     str message
 
+def _deadline_after(f64 seconds) -> int64:
+    if not (seconds >= 0.0 and seconds <= 9223372036.0):
+        raise MemcacheIllegalInputError(
+            "Timeout must be finite and between 0 and 9223372036 seconds",
+        )
+    if seconds == 0.0:
+        return 0
+    auto budget = int64(math.ceil(seconds * 1000000000.0))
+    auto now = time.monotonic_ns()
+    if budget > 9223372036854775807 - now:
+        return 9223372036854775807
+    return now + budget
+
+def _dial(str host, int64 port, f64 connect_timeout) -> bytes:
+    if len(host) == 0 or port < 1 or port > 65535:
+        raise MemcacheIllegalInputError(
+            "TCP connect requires a host and a port from 1 to 65535",
+        )
+    auto deadline = _deadline_after(connect_timeout)
+    try:
+        if deadline == 0:
+            return net.connect(host, port)
+        return net.connect_deadline(host, port, deadline)
+    except TimeoutError as message:
+        raise MemcacheTimeoutError(message)
+    except Exception as message:
+        raise MemcacheConnectionError(message)
+
 def _validate_key(bytes key):
     if len(key) == 0 or len(key) > 250:
         raise MemcacheIllegalInputError("A memcached key must contain 1 to 250 bytes")
@@ -293,7 +321,7 @@ def _loopback_protocol():
     try:
         scope(timeout=5000):
             spawn _fake_server(listener, value)
-            auto socket = net.connect("127.0.0.1", net.port(listener))
+            auto socket = _dial("localhost", net.port(listener), 3.0)
             try:
                 net.set_read_deadline(socket, 3000)
                 auto rejected = False
@@ -335,7 +363,7 @@ def _read_timeout():
     try:
         scope(timeout=5000):
             spawn _wait_for_close(listener)
-            auto socket = net.connect("127.0.0.1", net.port(listener))
+            auto socket = _dial("127.0.0.1", net.port(listener), 0.0)
             try:
                 net.set_read_deadline(socket, 30)
                 auto reader = _Reader(socket, b"VERSION 1.6\r")
@@ -349,3 +377,46 @@ def _read_timeout():
                 net.close_conn(socket)
     finally:
         net.close_listener(listener)
+
+@test
+def _connect_errors():
+    for seconds in [-1.0, math.inf, math.nan, 9223372037.0]:
+        auto rejected = False
+        try:
+            _dial("localhost", 11211, seconds)
+        except MemcacheIllegalInputError:
+            rejected = True
+        assert rejected
+    for port in [-1, 0, 65536]:
+        auto rejected = False
+        try:
+            _dial("localhost", port, 1.0)
+        except MemcacheIllegalInputError:
+            rejected = True
+        assert rejected
+    auto missing_host = False
+    try:
+        _dial("", 11211, 1.0)
+    except MemcacheIllegalInputError:
+        missing_host = True
+    assert missing_host
+
+    # A one-nanosecond deadline expires before the hostname can resolve.
+    auto expired = False
+    try:
+        auto socket = _dial("localhost", 11211, 0.000000001)
+        net.close_conn(socket)
+    except MemcacheTimeoutError:
+        expired = True
+    assert expired
+
+    auto listener = net.listen("127.0.0.1", 0)
+    auto port = net.port(listener)
+    net.close_listener(listener)
+    auto refused = False
+    try:
+        auto socket = _dial("127.0.0.1", port, 3.0)
+        net.close_conn(socket)
+    except MemcacheConnectionError:
+        refused = True
+    assert refused

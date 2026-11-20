@@ -7,7 +7,7 @@ Memcached client for [Zap](https://github.com/zaplang-io/zap) — an official **
 - Contributor & agent conventions: [AGENTS.md](AGENTS.md)
 - Design decisions: [DECISIONS.md](DECISIONS.md)
 
-> **Status: early / scaffolding.** Text framing, key validation, and typed protocol errors are in development under [issue #2](https://github.com/zaplang-io/memcached/issues/2). The TCP client depends on [Zap hostname connect deadlines](https://github.com/zaplang-io/zap/issues/1138). The examples below describe the target API.
+> **Status: early / scaffolding.** Text framing, key validation, typed protocol errors, and bounded TCP dialing are in development under [issue #2](https://github.com/zaplang-io/memcached/issues/2). The public client lifecycle depends on [Zap atomic field initialization](https://github.com/zaplang-io/zap/issues/1152). The examples below describe the target API.
 
 ## Goals
 
@@ -45,7 +45,7 @@ memcached speaks a line-oriented **text protocol** and a newer meta/binary proto
 
 ## Build and test
 
-Run `zap test src/memcached.zap` with a Zap toolchain that has native code generation enabled. The protocol tests use a loopback TCP fake and require no running memcached service.
+Run `zap test src/memcached.zap` with a native-codegen Zap toolchain that includes [hostname connect deadlines](https://github.com/zaplang-io/zap/issues/1138). The protocol tests use a loopback TCP fake and require no running memcached service.
 
 ## Development
 
