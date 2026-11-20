@@ -86,6 +86,23 @@ is called out in the README usage sketch.
   consumes replies through `END` and rejects duplicate or unrequested
   response keys.
 
+## Delete, counters, and touch (issue #5)
+
+- `delete` and `touch` return `False` on a miss with replies enabled.
+  `delete_many` and its alias `delete_multi` return `True` even when some
+  keys are absent. A batch validates all keys before writing and processes
+  one command per key under one client deadline. A transport or server
+  error can leave earlier deletions applied.
+  [pymemcache Client](https://pymemcache.readthedocs.io/en/latest/apidoc/pymemcache.client.base.html)
+- `incr` and `decr` take a `uint64` delta and return `Optional[uint64]`,
+  preserving memcached's full unsigned range. The server wraps increment
+  at 2⁶⁴ and clamps decrement to zero.
+  [Text protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt)
+- These commands default to `noreply=False`. With `noreply=True`, they
+  skip the read. Delete and touch report a completed write with `True`,
+  while the counter methods return `None` without a confirmed value.
+  [pymemcache Client](https://pymemcache.readthedocs.io/en/latest/apidoc/pymemcache.client.base.html)
+
 <!--
 Add one section per decision as issues are implemented, e.g.:
 
