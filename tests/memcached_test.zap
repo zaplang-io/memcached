@@ -1280,6 +1280,11 @@ def _serde_peer(bytes listener):
         net.send(socket, b"VALUE bad 889 3\r\nbad\r\nEND\r\n")
         assert reader._read_line() == b"get absent"
         net.send(socket, b"END\r\n")
+        for index in range(2):
+            assert reader._read_line() == b"get absent use-key"
+            net.send(socket, b"VALUE use-key 888 13\r\nuse-key:value\r\nEND\r\n")
+        assert reader._read_line() == b"gets use-key"
+        net.send(socket, b"VALUE use-key 888 13 9\r\nuse-key:value\r\nEND\r\n")
         assert net.recv(socket, 1) == ""
     finally:
         net.close_conn(socket)
@@ -1309,6 +1314,15 @@ def _custom_serde_dispatch():
                     decode_failed = message == "Memcached deserialization failed: custom deserialization error"
                 assert decode_failed
                 assert typed.get(b"absent", default=Optional.Some("default")).unwrap() == "default"
+                auto keys = [b"absent", b"use-key"]
+                auto hits = typed.get_many(keys)
+                assert len(hits) == 1 and hits[b"use-key"] == "value"
+                auto alias_hits = typed.get_multi(keys)
+                assert len(alias_hits) == 1 and alias_hits[b"use-key"] == "value"
+                auto cas_hits = typed.gets_many([b"use-key"])
+                assert len(cas_hits) == 1
+                auto value, token = cas_hits[b"use-key"]
+                assert value == "value" and token == b"9"
             finally:
                 typed.disconnect()
     finally:
@@ -1343,6 +1357,7 @@ def _live_serde():
         auto replaced = text.cas(b"serde:text", "after", token.unwrap())
         assert replaced.is_some(), "typed CAS must acknowledge the existing key"
         assert replaced.unwrap()
+        _expect_live_value(client, b"serde:text", 16, b"after")
         auto hits = text.get_multi([b"serde:absent", b"serde:text"])
         assert len(hits) == 1
         assert hits[b"serde:text"] == "after"
