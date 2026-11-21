@@ -17,13 +17,13 @@ version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$here/zap.toml")
 
 for kind in path registry; do
     consumer="$build/$kind-consumer"
-    mkdir -p "$consumer/src"
+    mkdir -p "$consumer/tests"
     cat > "$consumer/zap.toml" <<'MANIFEST'
 [package]
 name = "memcached_consumer"
 version = "0.0.0"
 MANIFEST
-    cp "$here/tests/package_consumer.zap" "$consumer/src/main.zap"
+    cp "$here/tests/package_consumer.zap" "$consumer/tests/package_consumer.zap"
     (
         cd "$consumer"
         if [ "$kind" = path ]; then
@@ -41,7 +41,7 @@ MANIFEST
         export ZAP_ZENV
         test -f zap.lock
         test -f "$ZAP_ZENV/pkg/memcached/src/memcached.zap"
-        timeout -k 5s 60s zap run src/main.zap
+        timeout -k 5s 60s zap test tests/package_consumer.zap
         echo "$kind consumer: PASS"
     )
 done
