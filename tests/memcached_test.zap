@@ -1360,8 +1360,11 @@ def _live_serde():
         _expect_live_value(client, b"serde:text", 16, b"after")
         auto raw_hits = client.get_many([b"serde:absent", b"serde:text"])
         assert len(raw_hits) == 1, "the server must return the post-CAS value to a raw batch"
+        auto decoded_hits = text.get_many([b"serde:absent", b"serde:text"])
+        assert len(decoded_hits) == 1, "the direct typed batch must return the same hit"
+        assert decoded_hits[b"serde:text"] == "after"
         auto hits = text.get_multi([b"serde:absent", b"serde:text"])
-        assert len(hits) == 1, "the typed batch must return the same hit"
+        assert len(hits) == 1, "the typed alias must return the same hit"
         assert hits[b"serde:text"] == "after"
         auto batch = text.gets_many([b"serde:text"])
         auto batch_value, batch_token = batch[b"serde:text"]
