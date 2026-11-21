@@ -1216,14 +1216,19 @@ def _live_admin():
         assert client.get(b"admin:stats").is_none()
 
         assert client.set_value(b"admin:delayed", b"eligible")
-        assert client.flush_all(delay=1, noreply=True)
-        auto expired = False
-        for attempt in range(40):
-            if client.get(b"admin:delayed").is_none():
-                expired = True
+        auto delay = 1
+        assert client.flush_all(delay=delay, noreply=True)
+        # The next command observes the clock after the silent flush was queued.
+        # Later tests share this server and must write past the flush's time window.
+        auto flush_time = int(str(client.stats()[b"time"]))
+        auto settled = False
+        for attempt in range(20):
+            if int(str(client.stats()[b"time"])) > flush_time + delay:
+                settled = True
                 break
-            time.sleep(0.1)
-        assert expired
+            time.sleep(0.25)
+        assert settled
+        assert client.get(b"admin:delayed").is_none()
         client.quit()
         assert client._reader == None
         assert client.version() == server_version
