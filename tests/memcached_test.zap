@@ -1317,7 +1317,7 @@ def _custom_serde_dispatch():
                 auto keys = [b"absent", b"use-key"]
                 auto hits = typed.get_many(keys)
                 assert len(hits) == 1 and hits[b"use-key"] == "value"
-                auto alias_hits = typed.get_multi(keys)
+                auto alias_hits = typed.get_multi([b"absent", b"use-key"])
                 assert len(alias_hits) == 1 and alias_hits[b"use-key"] == "value"
                 auto cas_hits = typed.gets_many([b"use-key"])
                 assert len(cas_hits) == 1
@@ -1358,8 +1358,10 @@ def _live_serde():
         assert replaced.is_some(), "typed CAS must acknowledge the existing key"
         assert replaced.unwrap()
         _expect_live_value(client, b"serde:text", 16, b"after")
+        auto raw_hits = client.get_many([b"serde:absent", b"serde:text"])
+        assert len(raw_hits) == 1, "the server must return the post-CAS value to a raw batch"
         auto hits = text.get_multi([b"serde:absent", b"serde:text"])
-        assert len(hits) == 1
+        assert len(hits) == 1, "the typed batch must return the same hit"
         assert hits[b"serde:text"] == "after"
         auto batch = text.gets_many([b"serde:text"])
         auto batch_value, batch_token = batch[b"serde:text"]
