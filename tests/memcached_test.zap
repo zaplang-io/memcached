@@ -1325,17 +1325,24 @@ def _live_serde():
     try:
         auto binary = bytes([0, 13, 10, 255])
         assert raw.set_value(b"serde:raw", binary)
-        assert raw.get(b"serde:raw").unwrap() == binary
         _expect_live_value(client, b"serde:raw", 0, binary)
+        auto raw_value = raw.get(b"serde:raw")
+        assert raw_value.is_some(), "bytes serde must return a stored hit"
+        assert raw_value.unwrap() == binary
         assert text.add(b"serde:text", "")
-        assert text.get(b"serde:text").unwrap() == ""
+        auto empty = text.get(b"serde:text")
+        assert empty.is_some(), "empty text must be distinguishable from a miss"
+        assert empty.unwrap() == ""
         assert text.replace(b"serde:text", "café")
         assert text.append(b"serde:text", "!")
         assert text.prepend(b"serde:text", "hello ")
         _expect_live_value(client, b"serde:text", 16, bytes("hello café!"))
         auto got, token = text.gets(b"serde:text")
+        assert got.is_some() and token.is_some(), "typed gets must return the value and token"
         assert got.unwrap() == "hello café!"
-        assert text.cas(b"serde:text", "after", token.unwrap()).unwrap()
+        auto replaced = text.cas(b"serde:text", "after", token.unwrap())
+        assert replaced.is_some(), "typed CAS must acknowledge the existing key"
+        assert replaced.unwrap()
         auto hits = text.get_multi([b"serde:absent", b"serde:text"])
         assert len(hits) == 1
         assert hits[b"serde:text"] == "after"
@@ -1348,13 +1355,17 @@ def _live_serde():
         assert text.set_value(b"serde:override", "raw", flags=Optional.Some(999))
         _expect_live_value(client, b"serde:override", 999, b"raw")
         assert client.set_value(b"serde:unknown", b"test", flags=999)
-        assert raw.get(b"serde:unknown").unwrap() == b"test"
+        auto unknown_bytes = raw.get(b"serde:unknown")
+        assert unknown_bytes.is_some(), "unknown flags must preserve a raw hit"
+        assert unknown_bytes.unwrap() == b"test"
         auto unknown_flag = False
         try:
             text.get(b"serde:unknown")
         except MemcacheSerdeError:
             unknown_flag = True
         assert unknown_flag
-        assert text.get(b"serde:text").unwrap() == "after"
+        auto after = text.get(b"serde:text")
+        assert after.is_some(), "a codec failure must leave the next read usable"
+        assert after.unwrap() == "after"
     finally:
         text.disconnect()
