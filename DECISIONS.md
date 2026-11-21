@@ -127,11 +127,25 @@ returns `Some(True)` after sending the request. The token is the decimal
   and closes the socket without reading, so the next operation can reconnect.
   [Text protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt)
 
+## Serde types and flags (issue #8)
+
+`Client` keeps the raw bytes API. `SerdeClient[T, Codec]` wraps a
+`Client` and uses a codec conforming to `Serde[T]`, giving each typed
+client one declared value type. Storage calls use the serialized flags
+unless a caller supplies an override. Read calls pass the actual flags
+and key to the codec. [pymemcache serde](https://github.com/pinterest/pymemcache/blob/master/pymemcache/serde.py)
+
+| Codec | Encoded flag | Read behavior |
+| --- | --- | --- |
+| `BytesSerde` | 0 | Pass bytes through for any flag |
+| `TextSerde` | 16 | Decode UTF-8, requiring flag 16 |
+
+Integer, pickle, and compressed flags remain available to custom codecs.
+The text codec raises `MemcacheSerdeError` for unexpected flags or invalid
+payloads. Custom codec errors use the same exception type.
+
 <!--
 Add one section per decision as issues are implemented, e.g.:
-
-## Serde flag map (issue #8)
-...the exact memcached flag values the typed serde uses...
 
 ## HashClient dead-server policy (issue #9)
 ...retry / eject behavior vs pymemcache...

@@ -1229,3 +1229,132 @@ def _live_admin():
         assert client.version() == server_version
     finally:
         client.disconnect()
+
+@test
+def _bytes_serde_preserves_payload():
+    auto serde = BytesSerde()
+    for payload in [b"", bytes([0, 13, 10, 255])]:
+        auto encoded, flags = serde.serialize(b"bytes", payload)
+        assert encoded == payload
+        assert flags == 0
+        assert serde.deserialize(b"bytes", encoded, flags) == payload
+        assert serde.deserialize(b"bytes", encoded, 4294967295) == payload
+
+@test
+def _typed_serde_flags():
+    auto text_codec = TextSerde()
+    for value in ["", "café\r\n"]:
+        auto encoded, flags = text_codec.serialize(b"text", value)
+        assert encoded == bytes(value) and flags == 16
+        assert text_codec.deserialize(b"text", encoded, flags) == value
+
+    auto bad_text = False
+    try:
+        text_codec.deserialize(b"text", bytes([255]), 16)
+    except MemcacheSerdeError:
+        bad_text = True
+    assert bad_text
+
+struct _KeySerde:
+    def serialize(self, bytes key, str value) -> (bytes, int64):
+        if value == "reject":
+            raise ValueError("custom serialization error")
+        return (key + b":" + bytes(value), 888)
+
+    def deserialize(self, bytes key, bytes value, int64 flags) -> str:
+        auto prefix = key + b":"
+        if flags != 888 or len(value) < len(prefix) or value[0:len(prefix)] != prefix:
+            raise ValueError("custom deserialization error")
+        return str(value[len(prefix):len(value)])
+
+def _serde_peer(bytes listener):
+    auto socket = net.accept(listener)
+    try:
+        net.set_deadline_ns(socket, _deadline_after(3.0))
+        auto reader = _Reader(socket, b"")
+        _expect_storage(reader, b"set use-key 888 0 13", b"use-key:value")
+        net.send(socket, b"STORED\r\n")
+        assert reader._read_line() == b"get use-key"
+        net.send(socket, b"VALUE use-key 888 13\r\nuse-key:value\r\nEND\r\n")
+        assert reader._read_line() == b"get bad"
+        net.send(socket, b"VALUE bad 889 3\r\nbad\r\nEND\r\n")
+        assert reader._read_line() == b"get absent"
+        net.send(socket, b"END\r\n")
+        assert net.recv(socket, 1) == ""
+    finally:
+        net.close_conn(socket)
+
+@test
+def _custom_serde_dispatch():
+    auto listener = net.listen("127.0.0.1", 0)
+    try:
+        scope(timeout=5000):
+            spawn _serde_peer(listener)
+            auto client = Client(host="localhost", port=net.port(listener), timeout=3.0)
+            auto typed = SerdeClient[str, _KeySerde](client, _KeySerde())
+            try:
+                auto encode_failed = False
+                try:
+                    typed.set_value(b"use-key", "reject")
+                except MemcacheSerdeError as message:
+                    encode_failed = message == "Memcached serialization failed: custom serialization error"
+                assert encode_failed
+                assert client._reader == None
+                assert typed.set_value(b"use-key", "value")
+                assert typed.get(b"use-key").unwrap() == "value"
+                auto decode_failed = False
+                try:
+                    typed.get(b"bad")
+                except MemcacheSerdeError as message:
+                    decode_failed = message == "Memcached deserialization failed: custom deserialization error"
+                assert decode_failed
+                assert typed.get(b"absent", default=Optional.Some("default")).unwrap() == "default"
+            finally:
+                typed.disconnect()
+    finally:
+        net.close_listener(listener)
+
+@test
+def _live_serde():
+    auto host = os.getenv("MEMCACHED_TEST_HOST")
+    if host == "":
+        return
+    auto client = Client(host=host, connect_timeout=3.0, timeout=3.0)
+    auto text = SerdeClient[str, TextSerde](client, TextSerde())
+    auto raw = SerdeClient[bytes, BytesSerde](client, BytesSerde())
+    try:
+        auto binary = bytes([0, 13, 10, 255])
+        assert raw.set_value(b"serde:raw", binary)
+        assert raw.get(b"serde:raw").unwrap() == binary
+        _expect_live_value(client, b"serde:raw", 0, binary)
+        assert text.add(b"serde:text", "")
+        assert text.get(b"serde:text").unwrap() == ""
+        assert text.replace(b"serde:text", "café")
+        assert text.append(b"serde:text", "!")
+        assert text.prepend(b"serde:text", "hello ")
+        _expect_live_value(client, b"serde:text", 16, bytes("hello café!"))
+        auto got, token = text.gets(b"serde:text")
+        assert got.unwrap() == "hello café!"
+        assert text.cas(b"serde:text", "after", token.unwrap()).unwrap()
+        auto hits = text.get_multi([b"serde:absent", b"serde:text"])
+        assert len(hits) == 1
+        assert hits[b"serde:text"] == "after"
+        auto batch = text.gets_many([b"serde:text"])
+        auto batch_value, batch_token = batch[b"serde:text"]
+        assert batch_value == "after" and batch_token != token.unwrap()
+        auto absent, absent_token = text.gets(b"serde:absent")
+        assert absent.is_none() and absent_token.is_none()
+
+        assert text.set_value(b"serde:override", "raw", flags=Optional.Some(999))
+        _expect_live_value(client, b"serde:override", 999, b"raw")
+        assert client.set_value(b"serde:unknown", b"test", flags=999)
+        assert raw.get(b"serde:unknown").unwrap() == b"test"
+        auto unknown_flag = False
+        try:
+            text.get(b"serde:unknown")
+        except MemcacheSerdeError:
+            unknown_flag = True
+        assert unknown_flag
+        assert text.get(b"serde:text").unwrap() == "after"
+    finally:
+        text.disconnect()

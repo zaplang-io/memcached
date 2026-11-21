@@ -13,7 +13,7 @@ Memcached client for [Zap](https://github.com/zaplang-io/zap) — an official **
 
 - A typed Zap client whose public API mirrors [**pymemcache**](https://pymemcache.readthedocs.io/) (`Client`, `PooledClient`, `HashClient`, and the serde layer) as closely as Zap's static typing allows. API-parity with the popular Python library is a project rule — see [AGENTS.md](AGENTS.md).
 - memcached's **text protocol** first; the newer meta/binary protocol is a later decision (see [DECISIONS.md](DECISIONS.md)).
-- Values are `bytes` by default, with an optional **serde** layer (serializer/deserializer keyed on memcached flags) for typed values, matching pymemcache's model.
+- `Client` works with raw bytes. `SerdeClient` uses a codec to store and read typed values using memcached flags.
 
 ## Usage
 
@@ -81,6 +81,23 @@ server version as bytes.
 `flush_all(delay=0, noreply=False)` invalidates all items on the server.
 Use `delay` to schedule the flush. `quit()` sends the quit command and
 closes the connection. The next operation reconnects.
+
+### Typed values
+
+```zap
+raw = memcached.Client(host="127.0.0.1")
+text = memcached.SerdeClient[str, memcached.TextSerde](raw, memcached.TextSerde())
+text.set_value(b"greeting", "hello", expire=60)
+greeting = text.get(b"greeting")
+text.disconnect()
+```
+
+A codec implements `serialize(key, value) -> (bytes, int64)` and
+`deserialize(key, bytes, flags) -> T`. Include the value type and codec
+type when constructing `SerdeClient`. Codec failures raise
+`MemcacheSerdeError`. An explicit `flags=Optional.Some(n)` overrides the
+codec flag on storage. Access the underlying `client` for administrative
+commands and raw byte operations.
 
 ## Planned APIs
 

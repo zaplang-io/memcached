@@ -30,6 +30,37 @@ struct MemcacheConnectionError:
 struct MemcacheTimeoutError:
     str message
 
+# A serializer rejected a value or a deserializer rejected stored data.
+struct MemcacheSerdeError:
+    str message
+
+interface Serde[T]:
+    def serialize(self, bytes key, T value) -> (bytes, int64)
+    def deserialize(self, bytes key, bytes value, int64 flags) -> T
+
+struct BytesSerde:
+    def serialize(self, bytes key, bytes value) -> (bytes, int64):
+        "Store the bytes unchanged with the default flag zero."
+        return (value, 0)
+
+    def deserialize(self, bytes key, bytes value, int64 flags) -> bytes:
+        "Return stored bytes unchanged for every flag."
+        return value
+
+struct TextSerde:
+    def serialize(self, bytes key, str value) -> (bytes, int64):
+        "Encode a UTF-8 string with pymemcache's text flag."
+        return (bytes(value), 16)
+
+    def deserialize(self, bytes key, bytes value, int64 flags) -> str:
+        "Decode a UTF-8 string tagged with the text flag."
+        if flags != 16:
+            raise MemcacheSerdeError("Expected memcached text flag 16")
+        try:
+            return str(value)
+        except Exception as message:
+            raise MemcacheSerdeError("Invalid memcached UTF-8 text: " + message)
+
 def _validate_timeout(f64 seconds):
     if not (seconds >= 0.0 and seconds <= 9223372036.0):
         raise MemcacheIllegalInputError(
@@ -730,3 +761,162 @@ struct Client:
             return reply
         finally:
             self._finish(keep)
+
+struct SerdeClient[T, S: Serde[T]]:
+    Client client
+    S serde
+
+    def connect(self):
+        "Open the underlying client connection."
+        self.client.connect()
+
+    def disconnect(self):
+        "Close the underlying client connection."
+        self.client.disconnect()
+
+    def set_value(
+        self,
+        bytes key,
+        T value,
+        int64 expire = 0,
+        Optional[int64] flags = None,
+        bool noreply = False,
+    ) -> bool:
+        "Serialize and store a value, using the codec flags unless explicitly overridden."
+        return self._store(b"set", key, value, expire, flags, noreply)
+
+    def add(
+        self,
+        bytes key,
+        T value,
+        int64 expire = 0,
+        Optional[int64] flags = None,
+        bool noreply = False,
+    ) -> bool:
+        "Serialize and store a value if the key is absent."
+        return self._store(b"add", key, value, expire, flags, noreply)
+
+    def replace(
+        self,
+        bytes key,
+        T value,
+        int64 expire = 0,
+        Optional[int64] flags = None,
+        bool noreply = False,
+    ) -> bool:
+        "Serialize and replace the value if the key exists."
+        return self._store(b"replace", key, value, expire, flags, noreply)
+
+    def append(
+        self,
+        bytes key,
+        T value,
+        int64 expire = 0,
+        Optional[int64] flags = None,
+        bool noreply = False,
+    ) -> bool:
+        "Append the serialized bytes while preserving the stored flags and expiration."
+        return self._store(b"append", key, value, expire, flags, noreply)
+
+    def prepend(
+        self,
+        bytes key,
+        T value,
+        int64 expire = 0,
+        Optional[int64] flags = None,
+        bool noreply = False,
+    ) -> bool:
+        "Prepend the serialized bytes while preserving the stored flags and expiration."
+        return self._store(b"prepend", key, value, expire, flags, noreply)
+
+    def cas(
+        self,
+        bytes key,
+        T value,
+        bytes cas,
+        int64 expire = 0,
+        Optional[int64] flags = None,
+        bool noreply = False,
+    ) -> Optional[bool]:
+        "Serialize and conditionally store a value using the token from gets or gets_many."
+        auto encoded, codec_flags = self._encode(key, value)
+        return self.client.cas(
+            key,
+            encoded,
+            cas,
+            expire,
+            flags.unwrap_or(codec_flags),
+            noreply,
+        )
+
+    def get(self, bytes key, Optional[T] default = None) -> Optional[T]:
+        "Deserialize a stored value or return default when the key is absent."
+        auto hits = self.client._retrieve([key], False)
+        if key in hits:
+            return Optional.Some(self._decode(key, hits[key]))
+        return default
+
+    def gets(self, bytes key) -> (Optional[T], Optional[bytes]):
+        "Return the decoded value and CAS token, or two None values on a miss."
+        auto hits = self.client._retrieve([key], True)
+        if key in hits:
+            auto hit = hits[key]
+            return (Optional.Some(self._decode(key, hit)), Optional.Some(hit.cas))
+        return (None, None)
+
+    def get_many(self, list[bytes] keys) -> dict[bytes, T]:
+        "Return decoded values for the requested keys that exist."
+        auto hits = self.client._retrieve(keys, False)
+        dict[bytes, T] values = {}
+        for key in hits:
+            values[key] = self._decode(key, hits[key])
+        return values
+
+    def get_multi(self, list[bytes] keys) -> dict[bytes, T]:
+        "Alias for get_many."
+        return self.get_many(keys)
+
+    def gets_many(self, list[bytes] keys) -> dict[bytes, (T, bytes)]:
+        "Return a decoded value and CAS token for each requested key that exists."
+        auto hits = self.client._retrieve(keys, True)
+        dict[bytes, (T, bytes)] values = {}
+        for key in hits:
+            auto hit = hits[key]
+            values[key] = (self._decode(key, hit), hit.cas)
+        return values
+
+    def _encode(self, bytes key, T value) -> (bytes, int64):
+        _validate_key(key)
+        try:
+            return self.serde.serialize(key, value)
+        except MemcacheSerdeError:
+            raise
+        except Exception as message:
+            raise MemcacheSerdeError("Memcached serialization failed: " + message)
+
+    def _decode(self, bytes key, _RetrievedValue hit) -> T:
+        try:
+            return self.serde.deserialize(key, hit.data, hit.flags)
+        except MemcacheSerdeError:
+            raise
+        except Exception as message:
+            raise MemcacheSerdeError("Memcached deserialization failed: " + message)
+
+    def _store(
+        self,
+        bytes command,
+        bytes key,
+        T value,
+        int64 expire,
+        Optional[int64] flags,
+        bool noreply,
+    ) -> bool:
+        auto encoded, codec_flags = self._encode(key, value)
+        return self.client._store(
+            command,
+            key,
+            encoded,
+            expire,
+            flags.unwrap_or(codec_flags),
+            noreply,
+        )
