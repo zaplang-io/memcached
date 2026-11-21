@@ -1,6 +1,7 @@
 import memcached
 
-def main():
+@test
+def _installed_package():
     auto client = memcached.Client(host="localhost")
     assert client.port == 11211
     client.disconnect()
