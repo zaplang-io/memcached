@@ -612,6 +612,80 @@ struct Client:
         finally:
             self._finish(keep)
 
+    def stats(self, bytes... args) -> dict[bytes, bytes]:
+        "Return raw STAT names and values. Pass subcommands as separate byte tokens."
+        list[bytes] parts = [b"stats"]
+        for arg in args:
+            _validate_key(arg)
+            parts.append(b" ")
+            parts.append(arg)
+        auto command = _join_fragments(parts, 0, len(parts))
+        auto reader = self._begin()
+        auto keep = False
+        try:
+            _send_line(reader._socket, command)
+            dict[bytes, bytes] result = {}
+            while True:
+                auto line = reader._read_line()
+                if line == b"END":
+                    keep = True
+                    return result
+                if len(line) <= 5 or line[0:5] != b"STAT ":
+                    raise MemcacheUnknownError("Unexpected memcached stats reply")
+                auto end = 5
+                while end < len(line) and line[end] != 32:
+                    if line[end] < 33 or line[end] > 126:
+                        raise MemcacheUnknownError("Invalid memcached statistic name")
+                    end = end + 1
+                if end == 5:
+                    raise MemcacheUnknownError("Missing memcached statistic name")
+                auto name = line[5:end]
+                auto value = b""
+                if end < len(line):
+                    value = line[end + 1:len(line)]
+                result[name] = value
+        finally:
+            self._finish(keep)
+
+    def flush_all(self, int64 delay = 0, bool noreply = False) -> bool:
+        "Invalidate all items on this server immediately or after a delay."
+        _validate_expire(delay)
+        auto reader = self._begin()
+        auto keep = False
+        try:
+            reader._send_command(b"flush_all " + bytes(str(delay)), noreply)
+            if not noreply and reader._read_line() != b"OK":
+                raise MemcacheUnknownError("Unexpected memcached flush_all reply")
+            keep = True
+            return True
+        finally:
+            self._finish(keep)
+
+    def version(self) -> bytes:
+        "Return the server version token."
+        auto reader = self._begin()
+        auto keep = False
+        try:
+            _send_line(reader._socket, b"version")
+            auto line = reader._read_line()
+            if len(line) <= 8 or line[0:8] != b"VERSION ":
+                raise MemcacheUnknownError("Unexpected memcached version reply")
+            for index in range(8, len(line)):
+                if line[index] < 33 or line[index] > 126:
+                    raise MemcacheUnknownError("Invalid memcached version token")
+            keep = True
+            return line[8:len(line)]
+        finally:
+            self._finish(keep)
+
+    def quit(self):
+        "Send quit and close the connection. A later command reconnects."
+        auto reader = self._begin()
+        try:
+            _send_line(reader._socket, b"quit")
+        finally:
+            self._finish(False)
+
     def _acquire(self):
         if not self._busy.compare_and_swap(0, 1):
             raise MemcacheConnectionError("Memcached client is already in use")

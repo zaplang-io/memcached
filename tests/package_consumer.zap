@@ -18,6 +18,12 @@ def main():
     except memcached.MemcacheIllegalInputError:
         invalid_token = True
     assert invalid_token
+    auto invalid_stat_arg = False
+    try:
+        client.stats(b"settings", b"invalid token")
+    except memcached.MemcacheIllegalInputError:
+        invalid_stat_arg = True
+    assert invalid_stat_arg
     try:
         raise memcached.MemcacheServerError("unavailable")
     except memcached.MemcacheServerError as message:
