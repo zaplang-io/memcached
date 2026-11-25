@@ -1,36 +1,45 @@
 # The server rejected a command or its arguments.
+@exception
 struct MemcacheClientError:
     str message
 
 # The server could not process a command.
+@exception
 struct MemcacheServerError:
     str message
 
 # The server did not recognize a command.
+@exception
 struct MemcacheUnknownCommandError:
     str message
 
 # The caller supplied an invalid argument.
+@exception
 struct MemcacheIllegalInputError:
     str message
 
 # The peer sent a malformed or unexpected protocol response.
+@exception
 struct MemcacheUnknownError:
     str message
 
 # The peer closed the connection before a complete reply arrived.
+@exception
 struct MemcacheUnexpectedCloseError:
     str message
 
 # The underlying TCP operation failed.
+@exception
 struct MemcacheConnectionError:
     str message
 
 # The underlying TCP operation exceeded its deadline.
+@exception
 struct MemcacheTimeoutError:
     str message
 
 # A serializer rejected a value or a deserializer rejected stored data.
+@exception
 struct MemcacheSerdeError:
     str message
 

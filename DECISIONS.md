@@ -38,13 +38,11 @@ is called out in the README usage sketch.
 - Keys must contain 1–250 printable ASCII bytes (0x21–0x7e). Callers that need
   to cache data under another key representation supply an ASCII encoding.
   [Text protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt)
-- The draft uses named Zap error structs catchable by their type or by
-  `Exception`. The public equivalent of pymemcache's `MemcacheError` base
-  remains a design decision because Zap user-defined types lack custom
-  inheritance (D-0015). Timeout and TCP failure have distinct package types,
+- Memcached errors use Zap's `@exception` declarations and can be caught
+  by their individual type or by `Exception`. Timeout and TCP failure have distinct package types,
   corresponding to pymemcache's timeout and socket errors. Server messages
   are decoded as UTF-8, with hex used for invalid UTF-8.
-  [pymemcache Client](https://pymemcache.readthedocs.io/en/latest/apidoc/pymemcache.client.base.html)
+  [pymemcache Client](https://pymemcache.readthedocs.io/en/latest/apidoc/pymemcache.client.base.html) · [Zap exception declarations](https://github.com/zaplang-io/zap/pull/1282)
 - The TCP dial helper takes a connect timeout in seconds, like pymemcache.
   Zero disables the timeout. A positive value is rounded up to a nanosecond
   and passed as an absolute monotonic deadline covering DNS and all TCP
