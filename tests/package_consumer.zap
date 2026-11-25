@@ -12,6 +12,12 @@ def _installed_package():
         memcached.TextSerde(),
     )
     assert len(typed.get_many([])) == 0
+    auto pool = memcached.PooledClient(host="localhost", max_pool_size=2)
+    assert len(pool.get_many([])) == 0
+    pool.disconnect()
+    auto ring = memcached.HashClient([("localhost", 11211)])
+    assert len(ring.get_many([])) == 0
+    ring.disconnect_all()
     auto invalid_key = False
     try:
         client.set_value(b"", b"value", expire=60, flags=3, noreply=True)

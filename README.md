@@ -99,14 +99,18 @@ type when constructing `SerdeClient`. Codec failures raise
 codec flag on storage. Access the underlying `client` for administrative
 commands and raw byte operations.
 
-## Planned APIs
-
-Multiple servers and pooling follow pymemcache:
+### Pooling and sharding
 
 ```zap
 pool = memcached.PooledClient(host="127.0.0.1", port=11211, max_pool_size=8)
-ring = memcached.HashClient([(b"10.0.0.1", 11211), (b"10.0.0.2", 11211)])
+ring = memcached.HashClient([("10.0.0.1", 11211), ("10.0.0.2", 11211)])
 ```
+
+A pooled command takes one connection and returns it to the pool on
+completion. A checkout at capacity raises `RuntimeError`. A hash client
+routes keys by rendezvous hashing and groups batch operations by server.
+Its `set_many` returns keys whose writes were declined or skipped.
+Use `ignore_exc=True` to retain partial results if one shard is unavailable.
 
 ## Protocol
 
@@ -118,7 +122,7 @@ Run `sh tools/run-tests.sh` with a native-codegen Zap toolchain that includes [h
 
 GitHub Actions runs the protocol suite and checks formatting on pull requests and pushes to `main`. It also runs `sh tools/run-package-tests.sh` to validate installation and imports from a path dependency and a temporary local registry using `tests/package_consumer.zap`.
 
-The loopback suite covers command framing, including a `noreply` write followed by an acknowledged command on the same socket. CI also runs the command tests against memcached 1.6. To run the live checks with a dedicated server on port 11211, set `MEMCACHED_TEST_HOST` when invoking `sh tools/run-tests.sh`.
+The loopback suite covers command framing, including a `noreply` write followed by an acknowledged command on the same socket. CI also runs the command tests against memcached 1.6. To run live checks, set `MEMCACHED_TEST_HOST` to a dedicated server on port 11211 when invoking `sh tools/run-tests.sh`. Set `MEMCACHED_TEST_SECOND_HOST` to a second server for the sharding checks.
 
 ## Development
 

@@ -1394,3 +1394,219 @@ def _live_serde():
         assert after.unwrap() == "after"
     finally:
         text.disconnect()
+
+def _pool_overlap_peer(
+    bytes listener,
+    channel[bool] first_seen,
+    channel[bool] both_seen,
+    channel[bool] proceed,
+):
+    auto first = net.accept(listener)
+    try:
+        net.set_deadline_ns(first, _deadline_after(3.0))
+        auto first_reader = _Reader(first, b"")
+        assert first_reader._read_line() == b"version"
+        first_seen <- True
+        auto second = net.accept(listener)
+        try:
+            net.set_deadline_ns(second, _deadline_after(3.0))
+            auto second_reader = _Reader(second, b"")
+            assert second_reader._read_line() == b"version"
+            both_seen <- True
+            assert <-proceed
+            net.send(first, b"VERSION first\r\n")
+            net.send(second, b"VERSION second\r\n")
+        finally:
+            net.close_conn(second)
+    finally:
+        net.close_conn(first)
+
+def _pooled_version(PooledClient pool, bytes version):
+    assert pool.version() == version
+
+@test
+def _pool_shares_two_connections_and_enforces_bound():
+    auto listener = net.listen("127.0.0.1", 0)
+    auto pool = PooledClient(
+        "localhost",
+        port=net.port(listener),
+        timeout=3.0,
+        max_pool_size=2,
+    )
+    auto first_seen = channel[bool]()
+    auto both_seen = channel[bool]()
+    auto proceed = channel[bool]()
+    try:
+        scope(timeout=5000):
+            spawn _pool_overlap_peer(listener, first_seen, both_seen, proceed)
+            spawn _pooled_version(pool, b"first")
+            assert <-first_seen
+            spawn _pooled_version(pool, b"second")
+            assert <-both_seen
+            auto full = False
+            try:
+                pool.version()
+            except RuntimeError as message:
+                full = message == "Memcached pool exhausted"
+            assert full
+            proceed <- True
+        assert len(pool._idle) == 2
+        pool.disconnect()
+        assert pool._size == 0
+    finally:
+        pool.disconnect()
+        net.close_listener(listener)
+
+def _pool_error_peer(bytes listener):
+    for attempt in range(2):
+        auto socket = net.accept(listener)
+        try:
+            net.set_deadline_ns(socket, _deadline_after(3.0))
+            auto reader = _Reader(socket, b"")
+            assert reader._read_line() == b"stats settings"
+            if attempt == 0:
+                net.send(socket, b"SERVER_ERROR test failure\r\n")
+            else:
+                net.send(socket, b"STAT threads 4\r\nEND\r\n")
+            assert net.recv(socket, 1) == ""
+        finally:
+            net.close_conn(socket)
+
+@test
+def _pool_returns_capacity_after_error():
+    auto listener = net.listen("127.0.0.1", 0)
+    auto pool = PooledClient(
+        "localhost",
+        port=net.port(listener),
+        timeout=3.0,
+        max_pool_size=1,
+    )
+    try:
+        scope(timeout=5000):
+            spawn _pool_error_peer(listener)
+            auto failed = False
+            try:
+                pool.stats(b"settings")
+            except MemcacheServerError:
+                failed = True
+            assert failed
+            assert len(pool._idle) == 1
+            assert pool.stats(b"settings")[b"threads"] == b"4"
+            pool.disconnect()
+        assert pool._size == 0
+        auto lease = pool._checkout()
+        pool.disconnect()
+        pool._return(lease)
+        assert pool._size == 0 and len(pool._idle) == 0
+    finally:
+        pool.disconnect()
+        net.close_listener(listener)
+
+@test
+def _hash_validates_and_matches_reference_hash():
+    assert _murmur32(b"") == uint32(0)
+    assert _murmur32(b"hello") == uint32(613153351)
+    assert _murmur32(b"foo") == uint32(4138058784)
+    assert _hash_key(b"alpha") == b"b'alpha'"
+    assert _hash_key(b"x'y") == b"b\"x'y\""
+    assert _hash_key(bytes([39, 34, 92])) == bytes([98, 39, 92, 39, 34, 92, 92, 39])
+
+    auto ring = HashClient([])
+    auto invalid = False
+    try:
+        ring.get_many([])
+    except MemcacheIllegalInputError:
+        invalid = True
+    assert invalid
+
+    auto duplicate = HashClient([("localhost", 11211), ("localhost", 11211)])
+    auto rejected = False
+    try:
+        duplicate.get(b"key")
+    except MemcacheIllegalInputError:
+        rejected = True
+    assert rejected
+
+def _keys_for_shards(HashClient ring) -> (bytes, bytes):
+    ring._init()
+    auto first = b""
+    auto second = b""
+    for index in range(100):
+        auto key = bytes("ring:key:" + str(index))
+        if ring._route(key) == 0:
+            first = key
+        else:
+            second = key
+        if len(first) > 0 and len(second) > 0:
+            return (first, second)
+    raise AssertionError("Fixture could not find a key for each shard")
+
+@test
+def _live_hash_batches_and_failed_shards():
+    auto host = os.getenv("MEMCACHED_TEST_HOST")
+    auto second_host = os.getenv("MEMCACHED_TEST_SECOND_HOST")
+    if host == "" or second_host == "":
+        return
+    auto first = Client(host, connect_timeout=3.0, timeout=3.0)
+    auto second = Client(second_host, connect_timeout=3.0, timeout=3.0)
+    auto ring = HashClient(
+        [(host, 11211), (second_host, 11211)],
+        connect_timeout=3.0,
+        timeout=3.0,
+        use_pooling=True,
+        max_pool_size=2,
+    )
+    auto single = HashClient([(host, 11211)], connect_timeout=3.0, timeout=3.0)
+    auto closed_listener = net.listen("127.0.0.1", 0)
+    auto closed_port = net.port(closed_listener)
+    net.close_listener(closed_listener)
+    auto failing = HashClient(
+        [(host, 11211), ("127.0.0.1", closed_port)],
+        connect_timeout=3.0,
+        timeout=3.0,
+        retry_attempts=1,
+        retry_timeout=0.0,
+        ignore_exc=True,
+    )
+    try:
+        auto key_a, key_b = _keys_for_shards(ring)
+        ring.delete_many([key_a, key_b])
+        assert len(ring.set_many({key_a: b"one", key_b: b"two"}, flags=7)) == 0
+        assert first.get(key_a).unwrap() == b"one"
+        assert second.get(key_b).unwrap() == b"two"
+        assert first.get(key_b).is_none() and second.get(key_a).is_none()
+        auto hits = ring.get_multi([key_b, key_a, key_b, b"ring:missing"])
+        assert len(hits) == 2
+        assert hits[key_a] == b"one" and hits[key_b] == b"two"
+        auto cas_hits = ring.gets_many([key_a, key_b])
+        auto value, token = cas_hits[key_a]
+        assert value == b"one"
+        assert ring.cas(key_a, b"new", token).unwrap()
+        assert ring.delete_multi([key_a, key_b])
+        assert len(ring.get_many([key_a, key_b])) == 0
+
+        assert single.set_value(b"ring:single", b"3")
+        assert single.incr(b"ring:single", uint64(2)).unwrap() == uint64(5)
+        assert first.get(b"ring:single").unwrap() == b"5"
+        assert single.touch(b"ring:single", expire=30)
+        assert single.delete(b"ring:single")
+        assert first.get(b"ring:single").is_none()
+
+        auto good, unavailable = _keys_for_shards(failing)
+        first.delete(unavailable)
+        assert failing.set_value(good, b"survivor")
+        auto partial = failing.get_many([unavailable, good])
+        assert len(partial) == 1 and partial[good] == b"survivor"
+        auto failed = failing.set_multi({unavailable: b"retry", good: b"updated"})
+        assert len(failed) == 1 and failed[0] == unavailable
+        assert failing._nodes[1].ejected
+        assert failing._route(unavailable) == 0
+        assert failing.set_value(unavailable, b"remapped")
+        assert first.get(unavailable).unwrap() == b"remapped"
+        assert first.get(good).unwrap() == b"updated"
+    finally:
+        failing.disconnect_all()
+        single.disconnect_all()
+        ring.disconnect_all()
+        second.disconnect()
+        first.disconnect()
