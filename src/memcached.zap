@@ -703,6 +703,9 @@ struct Client:
 
     def stats(self, bytes... args) -> dict[bytes, bytes]:
         "Return raw STAT names and values. Pass subcommands as separate byte tokens."
+        return self._stats(args)
+
+    def _stats(self, list[bytes] args) -> dict[bytes, bytes]:
         list[bytes] parts = [b"stats"]
         for arg in args:
             _validate_key(arg)
@@ -1260,9 +1263,12 @@ struct PooledClient:
 
     def stats(self, bytes... args) -> dict[bytes, bytes]:
         "Return raw STAT names and values. Pass subcommands as separate byte tokens."
+        return self._stats(args)
+
+    def _stats(self, list[bytes] args) -> dict[bytes, bytes]:
         auto lease = self._checkout()
         try:
-            return lease.client.stats(*args)
+            return lease.client._stats(args)
         finally:
             self._return(lease)
 
@@ -1290,27 +1296,34 @@ struct PooledClient:
         finally:
             self._return(lease)
 
-# A 32-bit rotation for MurmurHash3 x86_32.
-def _rotate32(uint32 value, int64 distance) -> uint32:
-    return value << distance | value >> 32 - distance
+# Mask each lane explicitly to preserve MurmurHash3's unsigned 32-bit arithmetic.
+def _low32(uint64 value) -> uint64:
+    return value & uint64(4294967295)
 
-def _murmur_word(uint32 word) -> uint32:
-    return _rotate32(word * uint32(3432918353), 15) * uint32(461845907)
+def _rotate32(uint64 value, uint64 distance) -> uint64:
+    return _low32(value << distance | value >> uint64(32) - distance)
 
-def _murmur32(bytes data) -> uint32:
-    uint32 result = 0
+def _murmur_word(uint64 word) -> uint64:
+    return _low32(
+        _rotate32(_low32(word * uint64(3432918353)), uint64(15)) * uint64(461845907),
+    )
+
+def _murmur32(bytes data) -> uint64:
+    uint64 result = 0
     auto start = 0
     while start + 4 <= len(data):
-        auto word = uint32(data[start]) | uint32(data[start + 1]) << 8 | uint32(data[start + 2]) << 16 | uint32(data[start + 3]) << 24
-        result = _rotate32(result ^ _murmur_word(word), 13) * uint32(5) + uint32(3864292196)
+        auto word = uint64(data[start]) | uint64(data[start + 1]) << uint64(8) | uint64(data[start + 2]) << uint64(16) | uint64(data[start + 3]) << uint64(24)
+        result = _low32(
+            _rotate32(result ^ _murmur_word(word), uint64(13)) * uint64(5) + uint64(3864292196),
+        )
         start = start + 4
-    uint32 tail = 0
+    uint64 tail = 0
     for index in range(start, len(data)):
-        tail = tail | uint32(data[index]) << (index - start) * 8
-    result = result ^ _murmur_word(tail) ^ uint32(len(data))
-    result = (result ^ result >> 16) * uint32(2246822507)
-    result = (result ^ result >> 13) * uint32(3266489909)
-    return result ^ result >> 16
+        tail = tail | uint64(data[index]) << uint64((index - start) * 8)
+    result = result ^ _murmur_word(tail) ^ uint64(len(data))
+    result = _low32((result ^ result >> uint64(16)) * uint64(2246822507))
+    result = _low32((result ^ result >> uint64(13)) * uint64(3266489909))
+    return result ^ result >> uint64(16)
 
 # Pymemcache hashes the Python bytes representation of a byte key.
 def _hash_key(bytes key) -> bytes:
@@ -1405,7 +1418,7 @@ struct HashClient:
         try:
             auto now = time.monotonic_ns()
             auto best = -1
-            uint32 best_score = 0
+            uint64 best_score = 0
             for index in range(len(self._nodes)):
                 auto node = self._nodes[index]
                 if not node.ejected or now >= node.eligible_at:
@@ -1751,7 +1764,7 @@ struct HashClient:
             auto stats = self._run[dict[bytes, bytes]](
                 index,
                 empty,
-                lambda pool: pool.stats(*args),
+                lambda pool: pool._stats(args),
             )
             result.append((self._nodes[index].name, stats))
         return result

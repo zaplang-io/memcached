@@ -1504,9 +1504,9 @@ def _pool_returns_capacity_after_error():
 
 @test
 def _hash_validates_and_matches_reference_hash():
-    assert _murmur32(b"") == uint32(0)
-    assert _murmur32(b"hello") == uint32(613153351)
-    assert _murmur32(b"foo") == uint32(4138058784)
+    assert _murmur32(b"") == uint64(0)
+    assert _murmur32(b"hello") == uint64(613153351)
+    assert _murmur32(b"foo") == uint64(4138058784)
     assert _hash_key(b"alpha") == b"b'alpha'"
     assert _hash_key(b"x'y") == b"b\"x'y\""
     assert _hash_key(bytes([39, 34, 92])) == bytes([98, 39, 92, 39, 34, 92, 92, 39])
