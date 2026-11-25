@@ -38,13 +38,11 @@ is called out in the README usage sketch.
 - Keys must contain 1–250 printable ASCII bytes (0x21–0x7e). Callers that need
   to cache data under another key representation supply an ASCII encoding.
   [Text protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt)
-- The draft uses named Zap error structs catchable by their type or by
-  `Exception`. The public equivalent of pymemcache's `MemcacheError` base
-  remains a design decision because Zap user-defined types lack custom
-  inheritance (D-0015). Timeout and TCP failure have distinct package types,
+- Memcached errors use Zap's `@exception` declarations and can be caught
+  by their individual type or by `Exception`. Timeout and TCP failure have distinct package types,
   corresponding to pymemcache's timeout and socket errors. Server messages
   are decoded as UTF-8, with hex used for invalid UTF-8.
-  [pymemcache Client](https://pymemcache.readthedocs.io/en/latest/apidoc/pymemcache.client.base.html)
+  [pymemcache Client](https://pymemcache.readthedocs.io/en/latest/apidoc/pymemcache.client.base.html) · [Zap exception declarations](https://github.com/zaplang-io/zap/pull/1282)
 - The TCP dial helper takes a connect timeout in seconds, like pymemcache.
   Zero disables the timeout. A positive value is rounded up to a nanosecond
   and passed as an absolute monotonic deadline covering DNS and all TCP
@@ -127,11 +125,25 @@ returns `Some(True)` after sending the request. The token is the decimal
   and closes the socket without reading, so the next operation can reconnect.
   [Text protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt)
 
+## Serde types and flags (issue #8)
+
+`Client` keeps the raw bytes API. `SerdeClient[T, Codec]` wraps a
+`Client` and uses a codec conforming to `Serde[T]`, giving each typed
+client one declared value type. Storage calls use the serialized flags
+unless a caller supplies an override. Read calls pass the actual flags
+and key to the codec. [pymemcache serde](https://github.com/pinterest/pymemcache/blob/master/pymemcache/serde.py)
+
+| Codec | Encoded flag | Read behavior |
+| --- | --- | --- |
+| `BytesSerde` | 0 | Pass bytes through for any flag |
+| `TextSerde` | 16 | Decode UTF-8, requiring flag 16 |
+
+Integer, pickle, and compressed flags remain available to custom codecs.
+The text codec raises `MemcacheSerdeError` for unexpected flags or invalid
+payloads. Custom codec errors use the same exception type.
+
 <!--
 Add one section per decision as issues are implemented, e.g.:
-
-## Serde flag map (issue #8)
-...the exact memcached flag values the typed serde uses...
 
 ## HashClient dead-server policy (issue #9)
 ...retry / eject behavior vs pymemcache...
