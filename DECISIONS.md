@@ -142,9 +142,27 @@ Integer, pickle, and compressed flags remain available to custom codecs.
 The text codec raises `MemcacheSerdeError` for unexpected flags or invalid
 payloads. Custom codec errors use the same exception type.
 
+## Pooling and sharding (issue #9)
+
+- `PooledClient` starts empty and defaults to eight connections. Checkout
+  raises `RuntimeError` at capacity. Each call returns its lease even on
+  failure. Disconnect closes idle sockets and retires outstanding leases as
+  they return. [pymemcache pool](https://github.com/pinterest/pymemcache/blob/master/pymemcache/pool.py)
+- `HashClient` takes a list of TCP `(str, int64)` endpoints. The first
+  operation validates and snapshots the list. Routing uses pymemcache's
+  seed-zero MurmurHash3 rendezvous scoring for bytes keys and an address
+  tie-break. Each endpoint has one connection unless `use_pooling=True`.
+  [pymemcache rendezvous](https://github.com/pinterest/pymemcache/blob/master/pymemcache/client/rendezvous.py)
+- A transport failure reserves the shard for another caller after
+  `retry_timeout` (default 1 second). Calls during that interval return
+  their miss or failure result. After the initial failure and
+  `retry_attempts` failed retries (default 2), routing excludes the node
+  for `dead_timeout` (default 60 seconds), then offers it traffic again.
+  Only future calls retry or remap. `ignore_exc=True` enables partial
+  shard results on errors, and invalid caller input still raises.
+  [pymemcache HashClient](https://github.com/pinterest/pymemcache/blob/master/pymemcache/client/hash.py)
+
 <!--
 Add one section per decision as issues are implemented, e.g.:
 
-## HashClient dead-server policy (issue #9)
-...retry / eject behavior vs pymemcache...
 -->

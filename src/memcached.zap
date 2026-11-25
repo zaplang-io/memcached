@@ -197,6 +197,11 @@ struct _RetrievedValue:
     int64 flags
     bytes cas
 
+struct _StoreRequest:
+    bytes key
+    bytes header
+    bytes value
+
 def _reply_uint(bytes field, uint64 maximum) -> uint64:
     if len(field) == 0:
         raise MemcacheUnknownError("Empty unsigned number in memcached reply")
@@ -388,6 +393,50 @@ struct Client:
     ) -> bool:
         "Store bytes under a key. With noreply, True confirms only the write."
         return self._store(b"set", key, value, expire, flags, noreply)
+
+    def set_many(
+        self,
+        dict[bytes, bytes] values,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> list[bytes]:
+        "Store every supplied value. Return keys whose writes were declined."
+        list[bytes] failed = []
+        if len(values) == 0:
+            return failed
+        list[_StoreRequest] requests = []
+        for key in values:
+            auto value = values[key]
+            auto header = _storage_header(
+                b"set",
+                key,
+                expire,
+                flags,
+                len(value),
+                noreply,
+            )
+            requests.append(_StoreRequest(key, header, value))
+        auto reader = self._begin()
+        auto keep = False
+        try:
+            for request in requests:
+                if not reader._write_storage(request.header, request.value, noreply):
+                    failed.append(request.key)
+            keep = True
+            return failed
+        finally:
+            self._finish(keep)
+
+    def set_multi(
+        self,
+        dict[bytes, bytes] values,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> list[bytes]:
+        "Alias for set_many."
+        return self.set_many(values, expire, flags, noreply)
 
     def add(
         self,
@@ -654,6 +703,9 @@ struct Client:
 
     def stats(self, bytes... args) -> dict[bytes, bytes]:
         "Return raw STAT names and values. Pass subcommands as separate byte tokens."
+        return self._stats(args)
+
+    def _stats(self, list[bytes] args) -> dict[bytes, bytes]:
         list[bytes] parts = [b"stats"]
         for arg in args:
             _validate_key(arg)
@@ -929,3 +981,807 @@ struct SerdeClient[T, S: Serde[T]]:
             flags.unwrap_or(codec_flags),
             noreply,
         )
+
+struct _PoolLease:
+    Client client
+    int64 generation
+
+struct PooledClient:
+    str host
+    int64 port = 11211
+    f64 connect_timeout = 0.0
+    f64 timeout = 0.0
+    int64 max_pool_size = 8
+    bytes _mutex = sync.mutex()
+    list[Client] _idle = []
+    int64 _size = 0
+    int64 _generation = 0
+
+    def set_many(
+        self,
+        dict[bytes, bytes] values,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> list[bytes]:
+        "Store every supplied value. Return keys whose writes were declined."
+        auto lease = self._checkout()
+        try:
+            return lease.client.set_many(values, expire, flags, noreply)
+        finally:
+            self._return(lease)
+
+    def set_multi(
+        self,
+        dict[bytes, bytes] values,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> list[bytes]:
+        "Alias for set_many."
+        return self.set_many(values, expire, flags, noreply)
+
+    def _checkout(self) -> _PoolLease:
+        sync.lock(self._mutex)
+        try:
+            if self.max_pool_size < 1:
+                raise MemcacheIllegalInputError("max_pool_size must be positive")
+            if len(self._idle) > 0:
+                return _PoolLease(self._idle.pop(), self._generation)
+            if self._size >= self.max_pool_size:
+                raise RuntimeError("Memcached pool exhausted")
+            auto client = Client(
+                self.host,
+                self.port,
+                self.connect_timeout,
+                self.timeout,
+            )
+            self._size = self._size + 1
+            return _PoolLease(client, self._generation)
+        finally:
+            sync.unlock(self._mutex)
+
+    def _return(self, _PoolLease lease):
+        sync.lock(self._mutex)
+        auto reusable = False
+        try:
+            reusable = lease.generation == self._generation
+            if reusable:
+                self._idle.append(lease.client)
+        finally:
+            sync.unlock(self._mutex)
+        if not reusable:
+            try:
+                lease.client.disconnect()
+            finally:
+                sync.lock(self._mutex)
+                self._size = self._size - 1
+                sync.unlock(self._mutex)
+
+    def disconnect(self):
+        "Close idle connections and retire in-flight connections when returned."
+        sync.lock(self._mutex)
+        auto idle = self._idle
+        list[Client] empty = []
+        self._idle = empty
+        self._generation = self._generation + 1
+        sync.unlock(self._mutex)
+        try:
+            for client in idle:
+                client.disconnect()
+        finally:
+            sync.lock(self._mutex)
+            self._size = self._size - len(idle)
+            sync.unlock(self._mutex)
+
+    def connect(self):
+        "Open the configured TCP connection. Reuse it if already open."
+        auto lease = self._checkout()
+        try:
+            lease.client.connect()
+        finally:
+            self._return(lease)
+
+    def set_value(
+        self,
+        bytes key,
+        bytes value,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> bool:
+        "Store bytes under a key. With noreply, True confirms only the write."
+        auto lease = self._checkout()
+        try:
+            return lease.client.set_value(key, value, expire, flags, noreply)
+        finally:
+            self._return(lease)
+
+    def add(
+        self,
+        bytes key,
+        bytes value,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> bool:
+        "Store a new key and return False if the key already exists."
+        auto lease = self._checkout()
+        try:
+            return lease.client.add(key, value, expire, flags, noreply)
+        finally:
+            self._return(lease)
+
+    def replace(
+        self,
+        bytes key,
+        bytes value,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> bool:
+        "Replace an existing value and return False if the key is absent."
+        auto lease = self._checkout()
+        try:
+            return lease.client.replace(key, value, expire, flags, noreply)
+        finally:
+            self._return(lease)
+
+    def append(
+        self,
+        bytes key,
+        bytes value,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> bool:
+        "Add bytes after an existing value while preserving its flags and expiration."
+        auto lease = self._checkout()
+        try:
+            return lease.client.append(key, value, expire, flags, noreply)
+        finally:
+            self._return(lease)
+
+    def prepend(
+        self,
+        bytes key,
+        bytes value,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> bool:
+        "Add bytes before an existing value while preserving its flags and expiration."
+        auto lease = self._checkout()
+        try:
+            return lease.client.prepend(key, value, expire, flags, noreply)
+        finally:
+            self._return(lease)
+
+    def cas(
+        self,
+        bytes key,
+        bytes value,
+        bytes cas,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> Optional[bool]:
+        "Store when the token matches. Return False for a stale token and None for a missing key. With noreply, True confirms only the write."
+        auto lease = self._checkout()
+        try:
+            return lease.client.cas(key, value, cas, expire, flags, noreply)
+        finally:
+            self._return(lease)
+
+    def get(self, bytes key, Optional[bytes] default = None) -> Optional[bytes]:
+        "Return the stored bytes, or default when the key is absent."
+        auto lease = self._checkout()
+        try:
+            return lease.client.get(key, default)
+        finally:
+            self._return(lease)
+
+    def gets(self, bytes key) -> (Optional[bytes], Optional[bytes]):
+        "Return the stored bytes and CAS token, or two None values on a miss."
+        auto lease = self._checkout()
+        try:
+            return lease.client.gets(key)
+        finally:
+            self._return(lease)
+
+    def get_many(self, list[bytes] keys) -> dict[bytes, bytes]:
+        "Return stored bytes for the requested keys that exist."
+        auto lease = self._checkout()
+        try:
+            return lease.client.get_many(keys)
+        finally:
+            self._return(lease)
+
+    def get_multi(self, list[bytes] keys) -> dict[bytes, bytes]:
+        "Return stored bytes for the requested keys that exist. Alias of get_many."
+        auto lease = self._checkout()
+        try:
+            return lease.client.get_multi(keys)
+        finally:
+            self._return(lease)
+
+    def gets_many(self, list[bytes] keys) -> dict[bytes, (bytes, bytes)]:
+        "Return a value and CAS token for each requested key that exists."
+        auto lease = self._checkout()
+        try:
+            return lease.client.gets_many(keys)
+        finally:
+            self._return(lease)
+
+    def delete(self, bytes key, bool noreply = False) -> bool:
+        "Delete a key. Return False for a miss when replies are enabled."
+        auto lease = self._checkout()
+        try:
+            return lease.client.delete(key, noreply)
+        finally:
+            self._return(lease)
+
+    def delete_many(self, list[bytes] keys, bool noreply = False) -> bool:
+        "Attempt every deletion. Return True after all commands complete."
+        auto lease = self._checkout()
+        try:
+            return lease.client.delete_many(keys, noreply)
+        finally:
+            self._return(lease)
+
+    def delete_multi(self, list[bytes] keys, bool noreply = False) -> bool:
+        "Alias for delete_many."
+        auto lease = self._checkout()
+        try:
+            return lease.client.delete_multi(keys, noreply)
+        finally:
+            self._return(lease)
+
+    def incr(self, bytes key, uint64 value, bool noreply = False) -> Optional[uint64]:
+        "Increment a counter. Return its new value, or None on a miss or silent write."
+        auto lease = self._checkout()
+        try:
+            return lease.client.incr(key, value, noreply)
+        finally:
+            self._return(lease)
+
+    def decr(self, bytes key, uint64 value, bool noreply = False) -> Optional[uint64]:
+        "Decrement a counter with a floor of zero. Return None on a miss or silent write."
+        auto lease = self._checkout()
+        try:
+            return lease.client.decr(key, value, noreply)
+        finally:
+            self._return(lease)
+
+    def touch(self, bytes key, int64 expire = 0, bool noreply = False) -> bool:
+        "Update a key's expiration. Zero clears expiration."
+        auto lease = self._checkout()
+        try:
+            return lease.client.touch(key, expire, noreply)
+        finally:
+            self._return(lease)
+
+    def stats(self, bytes... args) -> dict[bytes, bytes]:
+        "Return raw STAT names and values. Pass subcommands as separate byte tokens."
+        return self._stats(args)
+
+    def _stats(self, list[bytes] args) -> dict[bytes, bytes]:
+        auto lease = self._checkout()
+        try:
+            return lease.client._stats(args)
+        finally:
+            self._return(lease)
+
+    def flush_all(self, int64 delay = 0, bool noreply = False) -> bool:
+        "Invalidate all items on this server immediately or after a delay."
+        auto lease = self._checkout()
+        try:
+            return lease.client.flush_all(delay, noreply)
+        finally:
+            self._return(lease)
+
+    def version(self) -> bytes:
+        "Return the server version token."
+        auto lease = self._checkout()
+        try:
+            return lease.client.version()
+        finally:
+            self._return(lease)
+
+    def quit(self):
+        "Send quit and close the connection. A later command reconnects."
+        auto lease = self._checkout()
+        try:
+            lease.client.quit()
+        finally:
+            self._return(lease)
+
+# Mask each lane explicitly to preserve MurmurHash3's unsigned 32-bit arithmetic.
+def _low32(uint64 value) -> uint64:
+    return value & uint64(4294967295)
+
+def _rotate32(uint64 value, uint64 distance) -> uint64:
+    return _low32(value << distance | value >> uint64(32) - distance)
+
+def _murmur_word(uint64 word) -> uint64:
+    return _low32(
+        _rotate32(_low32(word * uint64(3432918353)), uint64(15)) * uint64(461845907),
+    )
+
+def _murmur32(bytes data) -> uint64:
+    uint64 result = 0
+    auto start = 0
+    while start + 4 <= len(data):
+        auto word = uint64(data[start]) | uint64(data[start + 1]) << uint64(8) | uint64(data[start + 2]) << uint64(16) | uint64(data[start + 3]) << uint64(24)
+        result = _low32(
+            _rotate32(result ^ _murmur_word(word), uint64(13)) * uint64(5) + uint64(3864292196),
+        )
+        start = start + 4
+    uint64 tail = 0
+    for index in range(start, len(data)):
+        tail = tail | uint64(data[index]) << uint64((index - start) * 8)
+    result = result ^ _murmur_word(tail) ^ uint64(len(data))
+    result = _low32((result ^ result >> uint64(16)) * uint64(2246822507))
+    result = _low32((result ^ result >> uint64(13)) * uint64(3266489909))
+    return result ^ result >> uint64(16)
+
+# Pymemcache hashes the Python bytes representation of a byte key.
+def _hash_key(bytes key) -> bytes:
+    auto quote = 39
+    auto has_single = False
+    auto has_double = False
+    for index in range(len(key)):
+        if key[index] == 39:
+            has_single = True
+        if key[index] == 34:
+            has_double = True
+    if has_single and not has_double:
+        quote = 34
+    list[int64] encoded = [98, quote]
+    for index in range(len(key)):
+        auto ch = key[index]
+        if ch == quote or ch == 92:
+            encoded.append(92)
+        encoded.append(ch)
+    encoded.append(quote)
+    return bytes(encoded)
+
+struct _HashNode:
+    bytes name
+    PooledClient pool
+    int64 failures = 0
+    int64 eligible_at = 0
+    bool ejected = False
+
+struct HashClient:
+    list[(str, int64)] servers
+    f64 connect_timeout = 0.0
+    f64 timeout = 0.0
+    int64 retry_attempts = 2
+    f64 retry_timeout = 1.0
+    f64 dead_timeout = 60.0
+    bool ignore_exc = False
+    bool use_pooling = False
+    int64 max_pool_size = 8
+    bytes _mutex = sync.mutex()
+    list[_HashNode] _nodes = []
+
+    def _init(self):
+        sync.lock(self._mutex)
+        try:
+            if len(self._nodes) > 0:
+                return
+            if len(self.servers) == 0:
+                raise MemcacheIllegalInputError(
+                    "HashClient requires at least one server",
+                )
+            if self.retry_attempts < 0 or self.retry_attempts == 9223372036854775807 or self.max_pool_size < 1:
+                raise MemcacheIllegalInputError(
+                    "Invalid HashClient retry or pool limit",
+                )
+            _validate_timeout(self.connect_timeout)
+            _validate_timeout(self.timeout)
+            _validate_timeout(self.retry_timeout)
+            _validate_timeout(self.dead_timeout)
+            auto capacity = 1
+            if self.use_pooling:
+                capacity = self.max_pool_size
+            list[_HashNode] nodes = []
+            dict[bytes, bool] seen = {}
+            for server in self.servers:
+                auto host, port = server
+                if len(host) == 0 or port < 1 or port > 65535:
+                    raise MemcacheIllegalInputError("Invalid HashClient server")
+                auto name = bytes(host + ":" + str(port))
+                if name in seen:
+                    raise MemcacheIllegalInputError("Duplicate HashClient server")
+                seen[name] = True
+                nodes.append(
+                    _HashNode(
+                        name,
+                        PooledClient(
+                            host,
+                            port,
+                            self.connect_timeout,
+                            self.timeout,
+                            capacity,
+                        ),
+                    ),
+                )
+            self._nodes = nodes
+        finally:
+            sync.unlock(self._mutex)
+
+    def _route(self, bytes key) -> int64:
+        auto encoded = _hash_key(key)
+        sync.lock(self._mutex)
+        try:
+            auto now = time.monotonic_ns()
+            auto best = -1
+            uint64 best_score = 0
+            for index in range(len(self._nodes)):
+                auto node = self._nodes[index]
+                if not node.ejected or now >= node.eligible_at:
+                    auto score = _murmur32(node.name + b"-" + encoded)
+                    if best < 0 or score > best_score or score == best_score and node.name > self._nodes[best].name:
+                        best = index
+                        best_score = score
+            return best
+        finally:
+            sync.unlock(self._mutex)
+
+    def _nominated(self, bytes key) -> int64:
+        _validate_key(key)
+        self._init()
+        auto index = self._route(key)
+        if index < 0 and not self.ignore_exc:
+            raise MemcacheConnectionError("All memcached servers are ejected")
+        return index
+
+    def _ready(self, _HashNode node) -> bool:
+        sync.lock(self._mutex)
+        try:
+            return time.monotonic_ns() >= node.eligible_at
+        finally:
+            sync.unlock(self._mutex)
+
+    def _healthy(self, _HashNode node):
+        sync.lock(self._mutex)
+        node.failures = 0
+        node.ejected = False
+        node.eligible_at = 0
+        sync.unlock(self._mutex)
+
+    def _failed(self, _HashNode node):
+        sync.lock(self._mutex)
+        try:
+            if node.ejected or node.failures >= self.retry_attempts:
+                node.ejected = True
+                node.eligible_at = _deadline_after(self.dead_timeout)
+            else:
+                node.failures = node.failures + 1
+                node.eligible_at = _deadline_after(self.retry_timeout)
+        finally:
+            sync.unlock(self._mutex)
+
+    def _run[T](self, int64 index, T fallback, fn(PooledClient) -> T action) -> T:
+        if index < 0:
+            return fallback
+        auto node = self._nodes[index]
+        if not self._ready(node):
+            return fallback
+        try:
+            auto result = action(node.pool)
+            self._healthy(node)
+            return result
+        except MemcacheIllegalInputError:
+            raise
+        except MemcacheConnectionError:
+            self._failed(node)
+            if not self.ignore_exc:
+                raise
+        except MemcacheTimeoutError:
+            self._failed(node)
+            if not self.ignore_exc:
+                raise
+        except MemcacheUnexpectedCloseError:
+            self._failed(node)
+            if not self.ignore_exc:
+                raise
+        except Exception:
+            if not self.ignore_exc:
+                raise
+        return fallback
+
+    def disconnect_all(self):
+        "Close pooled connections to every configured server."
+        self._init()
+        for node in self._nodes:
+            node.pool.disconnect()
+
+    def disconnect(self):
+        "Alias for disconnect_all."
+        self.disconnect_all()
+
+    def set_value(
+        self,
+        bytes key,
+        bytes value,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> bool:
+        "Store bytes under a key. With noreply, True confirms only the write."
+        auto index = self._nominated(key)
+        return self._run[bool](
+            index,
+            False,
+            lambda pool: pool.set_value(key, value, expire, flags, noreply),
+        )
+
+    def add(
+        self,
+        bytes key,
+        bytes value,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> bool:
+        "Store a new key and return False if the key already exists."
+        auto index = self._nominated(key)
+        return self._run[bool](
+            index,
+            False,
+            lambda pool: pool.add(key, value, expire, flags, noreply),
+        )
+
+    def replace(
+        self,
+        bytes key,
+        bytes value,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> bool:
+        "Replace an existing value and return False if the key is absent."
+        auto index = self._nominated(key)
+        return self._run[bool](
+            index,
+            False,
+            lambda pool: pool.replace(key, value, expire, flags, noreply),
+        )
+
+    def append(
+        self,
+        bytes key,
+        bytes value,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> bool:
+        "Add bytes after an existing value while preserving its flags and expiration."
+        auto index = self._nominated(key)
+        return self._run[bool](
+            index,
+            False,
+            lambda pool: pool.append(key, value, expire, flags, noreply),
+        )
+
+    def prepend(
+        self,
+        bytes key,
+        bytes value,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> bool:
+        "Add bytes before an existing value while preserving its flags and expiration."
+        auto index = self._nominated(key)
+        return self._run[bool](
+            index,
+            False,
+            lambda pool: pool.prepend(key, value, expire, flags, noreply),
+        )
+
+    def cas(
+        self,
+        bytes key,
+        bytes value,
+        bytes cas,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> Optional[bool]:
+        "Store when the token matches. Return False for a stale token and None for a missing key. With noreply, True confirms only the write."
+        auto index = self._nominated(key)
+        return self._run[Optional[bool]](
+            index,
+            Optional.Some(False),
+            lambda pool: pool.cas(key, value, cas, expire, flags, noreply),
+        )
+
+    def get(self, bytes key, Optional[bytes] default = None) -> Optional[bytes]:
+        "Return the stored bytes, or default when the key is absent."
+        auto index = self._nominated(key)
+        return self._run[Optional[bytes]](
+            index,
+            default,
+            lambda pool: pool.get(key, default),
+        )
+
+    def gets(self, bytes key) -> (Optional[bytes], Optional[bytes]):
+        "Return the stored bytes and CAS token, or two None values on a miss."
+        auto index = self._nominated(key)
+        return self._run[Optional[bytes], Optional[bytes]](
+            index,
+            (None, None),
+            lambda pool: pool.gets(key),
+        )
+
+    def delete(self, bytes key, bool noreply = False) -> bool:
+        "Delete a key. Return False for a miss when replies are enabled."
+        auto index = self._nominated(key)
+        return self._run[bool](index, False, lambda pool: pool.delete(key, noreply))
+
+    def incr(self, bytes key, uint64 value, bool noreply = False) -> Optional[uint64]:
+        "Increment a counter. Return its new value, or None on a miss or silent write."
+        auto index = self._nominated(key)
+        return self._run[Optional[uint64]](
+            index,
+            None,
+            lambda pool: pool.incr(key, value, noreply),
+        )
+
+    def decr(self, bytes key, uint64 value, bool noreply = False) -> Optional[uint64]:
+        "Decrement a counter with a floor of zero. Return None on a miss or silent write."
+        auto index = self._nominated(key)
+        return self._run[Optional[uint64]](
+            index,
+            None,
+            lambda pool: pool.decr(key, value, noreply),
+        )
+
+    def touch(self, bytes key, int64 expire = 0, bool noreply = False) -> bool:
+        "Update a key's expiration. Zero clears expiration."
+        auto index = self._nominated(key)
+        return self._run[bool](
+            index,
+            False,
+            lambda pool: pool.touch(key, expire, noreply),
+        )
+
+    def _groups(self, list[bytes] keys) -> dict[int64, list[bytes]]:
+        self._init()
+        for key in keys:
+            _validate_key(key)
+        dict[int64, list[bytes]] groups = {}
+        for key in keys:
+            auto index = self._route(key)
+            if index < 0 and not self.ignore_exc:
+                raise MemcacheConnectionError("All memcached servers are ejected")
+            if not index in groups:
+                list[bytes] empty = []
+                groups[index] = empty
+            groups[index].append(key)
+        return groups
+
+    def get_many(self, list[bytes] keys) -> dict[bytes, bytes]:
+        "Fetch each shard's keys and return all hits."
+        dict[bytes, bytes] hits = {}
+        auto groups = self._groups(keys)
+        for index in groups:
+            auto group = groups[index]
+            dict[bytes, bytes] empty = {}
+            auto found = self._run[dict[bytes, bytes]](
+                index,
+                empty,
+                lambda pool: pool.get_many(group),
+            )
+            for key in found:
+                hits[key] = found[key]
+        return hits
+
+    def get_multi(self, list[bytes] keys) -> dict[bytes, bytes]:
+        "Alias for get_many."
+        return self.get_many(keys)
+
+    def gets_many(self, list[bytes] keys) -> dict[bytes, (bytes, bytes)]:
+        "Fetch values and CAS tokens from their owning shards."
+        dict[bytes, (bytes, bytes)] hits = {}
+        auto groups = self._groups(keys)
+        for index in groups:
+            auto group = groups[index]
+            dict[bytes, (bytes, bytes)] empty = {}
+            auto found = self._run[dict[bytes, (bytes, bytes)]](
+                index,
+                empty,
+                lambda pool: pool.gets_many(group),
+            )
+            for key in found:
+                hits[key] = found[key]
+        return hits
+
+    def gets_multi(self, list[bytes] keys) -> dict[bytes, (bytes, bytes)]:
+        "Alias for gets_many."
+        return self.gets_many(keys)
+
+    def delete_many(self, list[bytes] keys, bool noreply = False) -> bool:
+        "Attempt deletions on every owning shard."
+        auto groups = self._groups(keys)
+        for index in groups:
+            auto group = groups[index]
+            self._run[bool](index, False, lambda pool: pool.delete_many(group, noreply))
+        return True
+
+    def delete_multi(self, list[bytes] keys, bool noreply = False) -> bool:
+        "Alias for delete_many."
+        return self.delete_many(keys, noreply)
+
+    def set_many(
+        self,
+        dict[bytes, bytes] values,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> list[bytes]:
+        "Store each value on its owning shard. Return failed or skipped keys."
+        list[bytes] keys = []
+        for key in values:
+            _storage_header(b"set", key, expire, flags, len(values[key]), noreply)
+            keys.append(key)
+        auto groups = self._groups(keys)
+        list[bytes] failed = []
+        for index in groups:
+            auto group = groups[index]
+            dict[bytes, bytes] batch = {}
+            for key in group:
+                batch[key] = values[key]
+            auto rejected = self._run[list[bytes]](
+                index,
+                group,
+                lambda pool: pool.set_many(batch, expire, flags, noreply),
+            )
+            for key in rejected:
+                failed.append(key)
+        return failed
+
+    def set_multi(
+        self,
+        dict[bytes, bytes] values,
+        int64 expire = 0,
+        int64 flags = 0,
+        bool noreply = False,
+    ) -> list[bytes]:
+        "Alias for set_many."
+        return self.set_many(values, expire, flags, noreply)
+
+    def stats(self, bytes... args) -> list[(bytes, dict[bytes, bytes])]:
+        "Return raw stats paired with each configured server's address."
+        self._init()
+        list[(bytes, dict[bytes, bytes])] result = []
+        for index in range(len(self._nodes)):
+            dict[bytes, bytes] empty = {}
+            auto stats = self._run[dict[bytes, bytes]](
+                index,
+                empty,
+                lambda pool: pool._stats(args),
+            )
+            result.append((self._nodes[index].name, stats))
+        return result
+
+    def flush_all(self, int64 delay = 0, bool noreply = False):
+        "Flush each configured server."
+        _validate_expire(delay)
+        self._init()
+        for index in range(len(self._nodes)):
+            self._run[bool](index, False, lambda pool: pool.flush_all(delay, noreply))
+
+    def quit(self):
+        "Send quit to each configured server and retire its pooled connections."
+        self._init()
+        for node in self._nodes:
+            try:
+                if self._ready(node):
+                    node.pool.quit()
+            finally:
+                node.pool.disconnect()

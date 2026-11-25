@@ -32,8 +32,16 @@ jobs:
           --health-interval 1s
           --health-timeout 3s
           --health-retries 30
+      memcached-second:
+        image: memcached:1.6@sha256:a395a1bcf5e0e2b0fa4a0142e12b4e24a2320ba4b7c6ffa8655a1a86e8f29dee
+        options: >-
+          --health-cmd "bash -c ': </dev/tcp/127.0.0.1/11211'"
+          --health-interval 1s
+          --health-timeout 3s
+          --health-retries 30
     env:
       MEMCACHED_TEST_HOST: memcached
+      MEMCACHED_TEST_SECOND_HOST: memcached-second
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
